@@ -915,7 +915,7 @@ fn goto_previous_buffer(cx: &mut Context) {
 }
 
 fn goto_buffer(editor: &mut Editor, direction: Direction, count: usize) {
-    let current = view!(editor).doc;
+    let current = view! { editor }.doc;
 
     let id = match direction {
         Direction::Forward => {
@@ -1931,49 +1931,49 @@ pub fn scroll(cx: &mut Context, offset: usize, direction: Direction, sync_cursor
 }
 
 fn page_up(cx: &mut Context) {
-    let view = view!(cx.editor);
+    let view = view! { cx.editor };
     let offset = view.inner_height();
     scroll(cx, offset, Direction::Backward, false);
 }
 
 fn page_down(cx: &mut Context) {
-    let view = view!(cx.editor);
+    let view = view! { cx.editor };
     let offset = view.inner_height();
     scroll(cx, offset, Direction::Forward, false);
 }
 
 fn half_page_up(cx: &mut Context) {
-    let view = view!(cx.editor);
+    let view = view! { cx.editor };
     let offset = view.inner_height() / 2;
     scroll(cx, offset, Direction::Backward, false);
 }
 
 fn half_page_down(cx: &mut Context) {
-    let view = view!(cx.editor);
+    let view = view! { cx.editor };
     let offset = view.inner_height() / 2;
     scroll(cx, offset, Direction::Forward, false);
 }
 
 fn page_cursor_up(cx: &mut Context) {
-    let view = view!(cx.editor);
+    let view = view! { cx.editor };
     let offset = view.inner_height();
     scroll(cx, offset, Direction::Backward, true);
 }
 
 fn page_cursor_down(cx: &mut Context) {
-    let view = view!(cx.editor);
+    let view = view! { cx.editor };
     let offset = view.inner_height();
     scroll(cx, offset, Direction::Forward, true);
 }
 
 fn page_cursor_half_up(cx: &mut Context) {
-    let view = view!(cx.editor);
+    let view = view! { cx.editor };
     let offset = view.inner_height() / 2;
     scroll(cx, offset, Direction::Backward, true);
 }
 
 fn page_cursor_half_down(cx: &mut Context) {
-    let view = view!(cx.editor);
+    let view = view! { cx.editor };
     let offset = view.inner_height() / 2;
     scroll(cx, offset, Direction::Forward, true);
 }
@@ -3157,7 +3157,7 @@ fn file_explorer_in_current_directory(cx: &mut Context) {
 }
 
 fn buffer_picker(cx: &mut Context) {
-    let current = view!(cx.editor).doc;
+    let current = view! { cx.editor }.doc;
 
     struct BufferMeta {
         id: DocumentId,
@@ -3483,7 +3483,7 @@ pub fn command_palette(cx: &mut Context) {
                     on_next_key_callback: None,
                     jobs: cx.jobs,
                 };
-                let focus = view!(ctx.editor).id;
+                let focus = view! { ctx.editor }.id;
 
                 command.execute(&mut ctx);
 
@@ -3919,7 +3919,7 @@ fn goto_last_modification(cx: &mut Context) {
 }
 
 fn goto_last_modified_file(cx: &mut Context) {
-    let view = view!(cx.editor);
+    let view = view! { cx.editor };
     let alternate_file = view
         .last_modified_docs
         .into_iter()
@@ -5680,19 +5680,45 @@ fn rotate_view_reverse(cx: &mut Context) {
 }
 
 fn jump_view_right(cx: &mut Context) {
-    cx.editor.focus_direction(tree::Direction::Right)
+    jump_view(cx, tree::Direction::Right);
 }
 
 fn jump_view_left(cx: &mut Context) {
-    cx.editor.focus_direction(tree::Direction::Left)
+    jump_view(cx, tree::Direction::Left);
 }
 
 fn jump_view_up(cx: &mut Context) {
-    cx.editor.focus_direction(tree::Direction::Up)
+    jump_view(cx, tree::Direction::Up);
 }
 
 fn jump_view_down(cx: &mut Context) {
-    cx.editor.focus_direction(tree::Direction::Down)
+    jump_view(cx, tree::Direction::Down);
+}
+
+fn jump_view(cx: &mut Context, direction: tree::Direction) {
+    if cx.editor.focus_direction(direction).is_err() {
+        jump_external_view(cx, direction);
+    }
+}
+
+fn jump_external_view(cx: &mut Context, direction: tree::Direction) {
+    let config = &cx.editor.config();
+
+    if config.smooth_panes {
+        let cmd = format!(
+            "wezterm cli activate-pane-direction {}",
+            match direction {
+                tree::Direction::Left => "Left",
+                tree::Direction::Down => "Down",
+                tree::Direction::Up => "Up",
+                tree::Direction::Right => "Right",
+            }
+        );
+
+        if let Some(err) = shell_impl(&config.shell, &cmd, None).err() {
+            cx.editor.set_error(err.to_string());
+        }
+    }
 }
 
 fn swap_view_right(cx: &mut Context) {
@@ -5757,7 +5783,7 @@ fn wclose(cx: &mut Context) {
             return;
         }
     }
-    let view_id = view!(cx.editor).id;
+    let view_id = view! { cx.editor }.id;
     // close current split
     cx.editor.close(view_id);
 }

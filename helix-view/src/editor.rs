@@ -428,6 +428,7 @@ pub struct Config {
     /// Whether to enable Kitty Keyboard Protocol
     pub kitty_keyboard_protocol: KittyKeyboardProtocolConfig,
     pub buffer_picker: BufferPickerConfig,
+    pub smooth_panes: bool,
 }
 
 #[derive(Debug, Default, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize, Clone, Copy)]
@@ -1146,6 +1147,7 @@ impl Default for Config {
             rainbow_brackets: false,
             kitty_keyboard_protocol: Default::default(),
             buffer_picker: BufferPickerConfig::default(),
+            smooth_panes: false,
         }
     }
 }
@@ -1804,7 +1806,7 @@ impl Editor {
                 return;
             }
             Action::Load => {
-                let view_id = view!(self).id;
+                let view_id = view! { self }.id;
                 let doc = doc_mut!(self, &id);
                 doc.ensure_view_init(view_id);
                 doc.mark_as_focused();
@@ -2105,10 +2107,15 @@ impl Editor {
         self.focus(self.tree.prev());
     }
 
-    pub fn focus_direction(&mut self, direction: tree::Direction) {
+    pub fn focus_direction(&mut self, direction: tree::Direction) -> anyhow::Result<(), ()> {
         let current_view = self.tree.focus;
+
         if let Some(id) = self.tree.find_split_in_direction(current_view, direction) {
-            self.focus(id)
+            self.focus(id);
+
+            Ok(())
+        } else {
+            Err(())
         }
     }
 
