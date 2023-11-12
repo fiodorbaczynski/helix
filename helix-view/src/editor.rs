@@ -325,6 +325,8 @@ pub struct Config {
     /// labels characters used in jumpmode
     #[serde(skip_serializing, deserialize_with = "deserialize_alphabet")]
     pub jump_label_alphabet: Vec<char>,
+    /// Whether to jump between tmux panes when a view jump is triggered at the edge of the editor. Defaults to `false`.
+    pub jump_tmux_panes: bool
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize, Eq, PartialOrd, Ord)]
@@ -902,6 +904,7 @@ impl Default for Config {
             popup_border: PopupBorderConfig::None,
             indent_heuristic: IndentationHeuristic::default(),
             jump_label_alphabet: ('a'..='z').collect(),
+            jump_tmux_panes: false
         }
     }
 }
@@ -1520,7 +1523,7 @@ impl Editor {
                 return;
             }
             Action::Load => {
-                let view_id = view!(self).id;
+                let view_id = view! { self }.id;
                 let doc = doc_mut!(self, &id);
                 doc.ensure_view_init(view_id);
                 doc.mark_as_focused();
@@ -1778,7 +1781,7 @@ impl Editor {
             }
         }
 
-        let view = view!(self, view_id);
+        let view = view! { self, view_id };
         let doc = doc_mut!(self, &view.doc);
         doc.mark_as_focused();
     }
@@ -1791,10 +1794,15 @@ impl Editor {
         self.focus(self.tree.prev());
     }
 
-    pub fn focus_direction(&mut self, direction: tree::Direction) {
+    pub fn focus_direction(&mut self, direction: tree::Direction) -> anyhow::Result<(), ()> {
         let current_view = self.tree.focus;
+
         if let Some(id) = self.tree.find_split_in_direction(current_view, direction) {
-            self.focus(id)
+            self.focus(id);
+
+            Ok(())
+        } else {
+            Err(())
         }
     }
 
