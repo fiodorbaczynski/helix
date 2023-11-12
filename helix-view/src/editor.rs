@@ -355,6 +355,8 @@ pub struct Config {
     pub end_of_line_diagnostics: DiagnosticFilter,
     // Set to override the default clipboard provider
     pub clipboard_provider: ClipboardProvider,
+    /// Whether to jump between external panes when a view jump is triggered at the edge of the editor. Defaults to `false`.
+    pub smooth_panes: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize, Eq, PartialOrd, Ord)]
@@ -995,6 +997,7 @@ impl Default for Config {
             inline_diagnostics: InlineDiagnosticsConfig::default(),
             end_of_line_diagnostics: DiagnosticFilter::Disable,
             clipboard_provider: ClipboardProvider::default(),
+            smooth_panes: false,
         }
     }
 }
@@ -1637,7 +1640,7 @@ impl Editor {
                 return;
             }
             Action::Load => {
-                let view_id = view!(self).id;
+                let view_id = view! { self }.id;
                 let doc = doc_mut!(self, &id);
                 doc.ensure_view_init(view_id);
                 doc.mark_as_focused();
@@ -1895,7 +1898,7 @@ impl Editor {
             }
         }
 
-        let view = view!(self, view_id);
+        let view = view! { self, view_id };
         let doc = doc_mut!(self, &view.doc);
         doc.mark_as_focused();
     }
@@ -1908,10 +1911,15 @@ impl Editor {
         self.focus(self.tree.prev());
     }
 
-    pub fn focus_direction(&mut self, direction: tree::Direction) {
+    pub fn focus_direction(&mut self, direction: tree::Direction) -> anyhow::Result<(), ()> {
         let current_view = self.tree.focus;
+
         if let Some(id) = self.tree.find_split_in_direction(current_view, direction) {
-            self.focus(id)
+            self.focus(id);
+
+            Ok(())
+        } else {
+            Err(())
         }
     }
 
