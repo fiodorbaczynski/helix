@@ -4872,11 +4872,11 @@ fn jump_tmux_view(cx: &mut Context, direction: tree::Direction) {
     if config.jump_tmux_panes {
         if let Ok(tmux_env) = std::env::var("TMUX") {
             if let Some((tmux_socket, _)) = tmux_env.split_once(",") {
-                let cmd = format!("tmux -S {} select-pane -{}", tmux_socket, match direction {
-                    tree::Direction::Left => "L",
-                    tree::Direction::Down => "D",
-                    tree::Direction::Up => "U",
-                    tree::Direction::Right => "R",
+                let cmd = format!("zellij action move-focus {}", match direction {
+                    tree::Direction::Left => "left",
+                    tree::Direction::Down => "down",
+                    tree::Direction::Up => "up",
+                    tree::Direction::Right => "right",
                 });
 
                 if let Some(err) = shell_impl(&config.shell, &cmd, None).err() {
