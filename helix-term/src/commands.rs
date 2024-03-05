@@ -4870,18 +4870,16 @@ fn jump_tmux_view(cx: &mut Context, direction: tree::Direction) {
     let config = &cx.editor.config();
 
     if config.jump_tmux_panes {
-        if let Ok(tmux_env) = std::env::var("TMUX") {
-            if let Some((tmux_socket, _)) = tmux_env.split_once(",") {
-                let cmd = format!("zellij action move-focus {}", match direction {
-                    tree::Direction::Left => "left",
-                    tree::Direction::Down => "down",
-                    tree::Direction::Up => "up",
-                    tree::Direction::Right => "right",
-                });
+        if let Ok(zellij_env) = std::env::var("ZELLIJ") && zellij_env == "0" {
+            let cmd = format!("zellij action move-focus {}", match direction {
+                tree::Direction::Left => "left",
+                tree::Direction::Down => "down",
+                tree::Direction::Up => "up",
+                tree::Direction::Right => "right",
+            });
 
-                if let Some(err) = shell_impl(&config.shell, &cmd, None).err() {
-                    cx.editor.set_error(err.to_string());
-                }
+            if let Some(err) = shell_impl(&config.shell, &cmd, None).err() {
+                cx.editor.set_error(err.to_string());
             }
         }
     }
