@@ -428,6 +428,8 @@ pub struct Config {
     /// Whether to enable Kitty Keyboard Protocol
     pub kitty_keyboard_protocol: KittyKeyboardProtocolConfig,
     pub buffer_picker: BufferPickerConfig,
+    /// Whether to jump between multiplexer panes when a view jump hits the edge of the editor.
+    pub smooth_panes: bool,
 }
 
 #[derive(Debug, Default, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize, Clone, Copy)]
@@ -1146,6 +1148,7 @@ impl Default for Config {
             rainbow_brackets: false,
             kitty_keyboard_protocol: Default::default(),
             buffer_picker: BufferPickerConfig::default(),
+            smooth_panes: false,
         }
     }
 }
@@ -2105,10 +2108,13 @@ impl Editor {
         self.focus(self.tree.prev());
     }
 
-    pub fn focus_direction(&mut self, direction: tree::Direction) {
+    pub fn focus_direction(&mut self, direction: tree::Direction) -> Result<(), ()> {
         let current_view = self.tree.focus;
         if let Some(id) = self.tree.find_split_in_direction(current_view, direction) {
-            self.focus(id)
+            self.focus(id);
+            Ok(())
+        } else {
+            Err(())
         }
     }
 
