@@ -5846,19 +5846,68 @@ fn rotate_view_reverse(cx: &mut Context) {
 }
 
 fn jump_view_right(cx: &mut Context) {
-    cx.editor.focus_direction(tree::Direction::Right)
+    jump_view(cx, tree::Direction::Right);
 }
 
 fn jump_view_left(cx: &mut Context) {
-    cx.editor.focus_direction(tree::Direction::Left)
+    jump_view(cx, tree::Direction::Left);
 }
 
 fn jump_view_up(cx: &mut Context) {
-    cx.editor.focus_direction(tree::Direction::Up)
+    jump_view(cx, tree::Direction::Up);
 }
 
 fn jump_view_down(cx: &mut Context) {
-    cx.editor.focus_direction(tree::Direction::Down)
+    jump_view(cx, tree::Direction::Down);
+}
+
+fn jump_view(cx: &mut Context, direction: tree::Direction) {
+    if cx.editor.focus_direction(direction).is_err() {
+        jump_external_view(cx, direction);
+    }
+}
+
+fn external_pane_command(direction: tree::Direction) -> Option<String> {
+    if std::env::var("ZELLIJ").is_ok() {
+        let dir = match direction {
+            tree::Direction::Left => "left",
+            tree::Direction::Down => "down",
+            tree::Direction::Up => "up",
+            tree::Direction::Right => "right",
+        };
+        Some(format!("zellij action move-focus {dir}"))
+    } else if let Ok(tmux_env) = std::env::var("TMUX") {
+        let socket = tmux_env.split(',').next().unwrap_or("default");
+        let flag = match direction {
+            tree::Direction::Left => "L",
+            tree::Direction::Down => "D",
+            tree::Direction::Up => "U",
+            tree::Direction::Right => "R",
+        };
+        Some(format!("tmux -S {socket} select-pane -{flag}"))
+    } else if std::env::var("WEZTERM_PANE").is_ok() {
+        let dir = match direction {
+            tree::Direction::Left => "Left",
+            tree::Direction::Down => "Down",
+            tree::Direction::Up => "Up",
+            tree::Direction::Right => "Right",
+        };
+        Some(format!("wezterm cli activate-pane-direction {dir}"))
+    } else {
+        None
+    }
+}
+
+fn jump_external_view(cx: &mut Context, direction: tree::Direction) {
+    if !cx.editor.config().smooth_panes {
+        return;
+    }
+
+    if let Some(cmd) = external_pane_command(direction) {
+        if let Err(err) = shell_impl(&cx.editor.config().shell, &cmd, None) {
+            cx.editor.set_error(err.to_string());
+        }
+    }
 }
 
 fn swap_view_right(cx: &mut Context) {
