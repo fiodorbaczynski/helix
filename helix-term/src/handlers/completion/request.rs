@@ -207,9 +207,9 @@ fn request_completions(
                 trigger_character: None,
             }
         } else {
+            let caps = ls.capabilities();
             let trigger_char =
-                ls.capabilities()
-                    .completion_provider
+                caps.completion_provider
                     .as_ref()
                     .and_then(|provider| {
                         provider
