@@ -1609,11 +1609,12 @@ fn lsp_workspace_command(
     let ls_id_commands = doc
         .language_servers_with_feature(LanguageServerFeature::WorkspaceCommand)
         .flat_map(|ls| {
+            let id = ls.id();
             ls.capabilities()
                 .execute_command_provider
-                .iter()
-                .flat_map(|options| options.commands.iter())
-                .map(|command| (ls.id(), command))
+                .into_iter()
+                .flat_map(|options| options.commands.into_iter())
+                .map(move |command| (id, command))
         });
 
     if args.is_empty() {
@@ -1656,7 +1657,7 @@ fn lsp_workspace_command(
     } else {
         let command = args[0].to_string();
         let matches: Vec<_> = ls_id_commands
-            .filter(|(_ls_id, c)| *c == &command)
+            .filter(|(_ls_id, c)| c == &command)
             .collect();
 
         match matches.as_slice() {
