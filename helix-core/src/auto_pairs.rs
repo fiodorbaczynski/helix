@@ -342,6 +342,7 @@ fn handle_same(doc: &Rope, selection: &Selection, pair: &Pair) -> Transaction {
         let cursor = start_range.cursor(doc.slice(..));
         let mut len_inserted = 0;
         let next_char = doc.get_char(cursor);
+        let mut completing_triple = false;
 
         let change = if next_char == Some(pair.open) {
             //  return transaction that moves past close
@@ -350,9 +351,25 @@ fn handle_same(doc: &Rope, selection: &Selection, pair: &Pair) -> Transaction {
             let mut pair_str = Tendril::new();
             pair_str.push(pair.open);
 
-            // for equal pairs, don't insert both open and close if either
-            // side has a non-pair char
-            if pair.should_close(doc, start_range) {
+            let prev = prev_char(doc, cursor);
+            let prev_prev = if cursor >= 2 {
+                doc.get_char(cursor - 2)
+            } else {
+                None
+            };
+            completing_triple =
+                prev == Some(pair.open) && prev_prev == Some(pair.open);
+
+            if completing_triple {
+                // Complete triple: insert closing triple with empty line between
+                pair_str.push('\n');
+                pair_str.push('\n');
+                pair_str.push(pair.close);
+                pair_str.push(pair.close);
+                pair_str.push(pair.close);
+            } else if pair.should_close(doc, start_range) {
+                // for equal pairs, don't insert both open and close if either
+                // side has a non-pair char
                 pair_str.push(pair.close);
             }
 
@@ -360,7 +377,11 @@ fn handle_same(doc: &Rope, selection: &Selection, pair: &Pair) -> Transaction {
             (cursor, cursor, Some(pair_str))
         };
 
-        let next_range = get_next_range(doc, start_range, offs, len_inserted);
+        // For triple completion, position the cursor on the empty line
+        // between the opening and closing triples (offset 3 within the
+        // 6-char insertion), while offs tracks the full insertion length.
+        let range_len = if completing_triple { 3 } else { len_inserted };
+        let next_range = get_next_range(doc, start_range, offs, range_len);
         end_ranges.push(next_range);
         offs += len_inserted;
 
