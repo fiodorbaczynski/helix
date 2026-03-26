@@ -81,6 +81,70 @@ pub struct Application {
     theme_mode: Option<theme::Mode>,
 }
 
+fn apply_dynamic_registration(
+    client: &helix_lsp::Client,
+    method: &str,
+    options: Option<serde_json::Value>,
+) {
+    use lsp::*;
+
+    client.update_capabilities(|caps| match method {
+        <request::Formatting as request::Request>::METHOD => {
+            caps.document_formatting_provider = Some(OneOf::Left(true));
+        }
+        <request::RangeFormatting as request::Request>::METHOD => {
+            caps.document_range_formatting_provider = Some(OneOf::Left(true));
+        }
+        <request::Completion as request::Request>::METHOD => {
+            let completion_options = options
+                .and_then(|o| serde_json::from_value::<CompletionOptions>(o).ok())
+                .unwrap_or_default();
+            caps.completion_provider = Some(completion_options);
+        }
+        <request::HoverRequest as request::Request>::METHOD => {
+            caps.hover_provider = Some(HoverProviderCapability::Simple(true));
+        }
+        <request::CodeActionRequest as request::Request>::METHOD => {
+            caps.code_action_provider = Some(CodeActionProviderCapability::Simple(true));
+        }
+        <request::SignatureHelpRequest as request::Request>::METHOD => {
+            let sig_options = options
+                .and_then(|o| serde_json::from_value::<SignatureHelpOptions>(o).ok())
+                .unwrap_or_default();
+            caps.signature_help_provider = Some(sig_options);
+        }
+        <request::Rename as request::Request>::METHOD => {
+            caps.rename_provider = Some(OneOf::Left(true));
+        }
+        <request::DocumentSymbolRequest as request::Request>::METHOD => {
+            caps.document_symbol_provider = Some(OneOf::Left(true));
+        }
+        <request::WorkspaceSymbolRequest as request::Request>::METHOD => {
+            caps.workspace_symbol_provider = Some(OneOf::Left(true));
+        }
+        <request::GotoDefinition as request::Request>::METHOD => {
+            caps.definition_provider = Some(OneOf::Left(true));
+        }
+        <request::GotoTypeDefinition as request::Request>::METHOD => {
+            caps.type_definition_provider = Some(TypeDefinitionProviderCapability::Simple(true));
+        }
+        <request::References as request::Request>::METHOD => {
+            caps.references_provider = Some(OneOf::Left(true));
+        }
+        <request::DocumentHighlightRequest as request::Request>::METHOD => {
+            caps.document_highlight_provider = Some(OneOf::Left(true));
+        }
+        <request::InlayHintRequest as request::Request>::METHOD => {
+            caps.inlay_hint_provider = Some(OneOf::Left(true));
+        }
+        _ => {
+            log::warn!(
+                "Unhandled dynamic capability registration for method: {method}"
+            );
+        }
+    });
+}
+
 #[cfg(feature = "integration")]
 fn setup_integration_logging() {
     let level = std::env::var("HELIX_LOG_LEVEL")
@@ -1068,14 +1132,8 @@ impl Application {
                                             ops,
                                         )
                                     }
-                                    _ => {
-                                        // Language Servers based on the `vscode-languageserver-node` library often send
-                                        // client/registerCapability even though we do not enable dynamic registration
-                                        // for most capabilities. We should send a MethodNotFound JSONRPC error in this
-                                        // case but that rejects the registration promise in the server which causes an
-                                        // exit. So we work around this by ignoring the request and sending back an OK
-                                        // response.
-                                        log::warn!("Ignoring a client/registerCapability request because dynamic capability registration is not enabled. Please report this upstream to the language server");
+                                    method => {
+                                        apply_dynamic_registration(client, method, reg.register_options);
                                     }
                                 }
                             }
