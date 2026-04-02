@@ -926,6 +926,13 @@ impl Application {
                     Notification::ProgressMessage(_params) => {
                         // do nothing
                     }
+                    Notification::ShowPopup(params) => {
+                        let contents =
+                            ui::Markdown::new(params.contents, self.editor.syn_loader.clone());
+                        let popup =
+                            ui::Popup::new("lsp-show-popup", contents).auto_close(true);
+                        self.compositor.replace_or_push("lsp-show-popup", popup);
+                    }
                     Notification::Exit => {
                         self.editor.set_status("Language server exited");
 

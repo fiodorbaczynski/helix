@@ -523,6 +523,11 @@ impl MethodCall {
     }
 }
 
+#[derive(Debug, PartialEq, Clone, serde::Deserialize)]
+pub struct ShowPopupParams {
+    pub contents: String,
+}
+
 #[derive(Debug, PartialEq, Clone)]
 pub enum Notification {
     // we inject this notification to signal the LSP is ready
@@ -533,6 +538,7 @@ pub enum Notification {
     ShowMessage(lsp::ShowMessageParams),
     LogMessage(lsp::LogMessageParams),
     ProgressMessage(lsp::ProgressParams),
+    ShowPopup(ShowPopupParams),
 }
 
 impl Notification {
@@ -558,6 +564,10 @@ impl Notification {
             lsp::notification::Progress::METHOD => {
                 let params: lsp::ProgressParams = params.parse()?;
                 Self::ProgressMessage(params)
+            }
+            "helix/showPopup" => {
+                let params: ShowPopupParams = params.parse()?;
+                Self::ShowPopup(params)
             }
             _ => {
                 return Err(Error::Unhandled);
