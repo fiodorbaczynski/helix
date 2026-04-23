@@ -23,15 +23,51 @@ pub fn workspace_root(cwd: &Path) -> Option<PathBuf> {
 
 #[cfg(target_os = "macos")]
 mod imp {
-    use super::PathBuf;
+    use std::path::PathBuf;
+    use std::sync::mpsc;
 
+    use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
+
+    /// Holds the live FSEvents stream for the workspace.
+    ///
+    /// Dropping this value stops the stream: the underlying `Watcher` is
+    /// dropped, its sync sender disconnects, and the bridging blocking task
+    /// exits when `recv` returns `Err`.
     pub struct FileWatcher {
-        _root: PathBuf,
+        _watcher: RecommendedWatcher,
     }
 
     impl FileWatcher {
         pub fn start(root: PathBuf) -> Option<Self> {
-            Some(Self { _root: root })
+            let (tx, rx) = mpsc::channel::<notify::Result<Event>>();
+
+            let mut watcher = match RecommendedWatcher::new(tx, Config::default()) {
+                Ok(watcher) => watcher,
+                Err(err) => {
+                    log::warn!("file watcher unavailable: {err}");
+                    return None;
+                }
+            };
+
+            if let Err(err) = watcher.watch(&root, RecursiveMode::Recursive) {
+                log::warn!("failed to watch workspace {}: {err}", root.display());
+                return None;
+            }
+
+            log::info!("watching workspace for external changes: {}", root.display());
+
+            tokio::task::spawn_blocking(move || drain(rx));
+
+            Some(Self { _watcher: watcher })
+        }
+    }
+
+    fn drain(rx: mpsc::Receiver<notify::Result<Event>>) {
+        while let Ok(result) = rx.recv() {
+            match result {
+                Ok(event) => log::trace!("fs event: {event:?}"),
+                Err(err) => log::warn!("file watcher error: {err}"),
+            }
         }
     }
 }
