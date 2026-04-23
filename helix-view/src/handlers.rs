@@ -1,5 +1,4 @@
 use completion::{CompletionEvent, CompletionHandler};
-use file_watcher::FileWatcher;
 use helix_event::send_blocking;
 use tokio::sync::mpsc::Sender;
 
@@ -30,7 +29,6 @@ pub struct Handlers {
     pub pull_diagnostics: Sender<lsp::PullDiagnosticsEvent>,
     pub pull_all_documents_diagnostics: Sender<lsp::PullAllDocumentsDiagnosticsEvent>,
     pub code_action_hint: Sender<lsp::CodeActionHintEvent>,
-    pub file_watcher: Option<FileWatcher>,
 }
 
 impl Handlers {
