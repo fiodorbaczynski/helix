@@ -1208,6 +1208,7 @@ pub struct Editor {
     pub language_servers: helix_lsp::Registry,
     pub diagnostics: Diagnostics,
     pub diff_providers: DiffProviderRegistry,
+    pub file_watcher: Option<crate::handlers::file_watcher::FileWatcher>,
 
     pub debug_adapters: dap::registry::Registry,
     pub breakpoints: HashMap<PathBuf, Vec<Breakpoint>>,
@@ -1337,6 +1338,11 @@ impl Editor {
         let conf = config.load();
         let auto_pairs = (&conf.auto_pairs).into();
 
+        let file_watcher = crate::handlers::file_watcher::workspace_root(
+            &helix_stdx::env::current_working_dir(),
+        )
+        .and_then(crate::handlers::file_watcher::FileWatcher::start);
+
         // HAXX: offset the render area height by 1 to account for prompt/commandline
         area.height -= 1;
 
@@ -1355,6 +1361,7 @@ impl Editor {
             theme: theme_loader.default(),
             language_servers,
             diagnostics: Diagnostics::new(),
+            file_watcher,
             diff_providers: DiffProviderRegistry::default(),
             debug_adapters: dap::registry::Registry::new(),
             breakpoints: HashMap::new(),
