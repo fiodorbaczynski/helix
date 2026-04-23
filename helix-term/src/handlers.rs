@@ -10,7 +10,7 @@ use crate::handlers::auto_save::AutoSaveHandler;
 use crate::handlers::diagnostics::PullDiagnosticsHandler;
 use crate::handlers::signature_help::SignatureHelpHandler;
 
-pub use helix_view::handlers::{file_watcher, word_index, Handlers};
+pub use helix_view::handlers::{word_index, Handlers};
 
 use self::document_colors::DocumentColorsHandler;
 use self::document_links::DocumentLinksHandler;
@@ -38,9 +38,6 @@ pub fn setup(config: Arc<ArcSwap<Config>>) -> Handlers {
     let pull_diagnostics = PullDiagnosticsHandler::default().spawn();
     let pull_all_documents_diagnostics = PullAllDocumentsDiagnosticHandler::default().spawn();
 
-    let file_watcher = file_watcher::workspace_root(&helix_stdx::env::current_working_dir())
-        .and_then(file_watcher::FileWatcher::start);
-
     let handlers = Handlers {
         completions: helix_view::handlers::completion::CompletionHandler::new(event_tx),
         signature_hints,
@@ -50,7 +47,6 @@ pub fn setup(config: Arc<ArcSwap<Config>>) -> Handlers {
         word_index,
         pull_diagnostics,
         pull_all_documents_diagnostics,
-        file_watcher,
     };
 
     helix_view::handlers::register_hooks(&handlers);
