@@ -50,6 +50,7 @@ pub fn setup(config: Arc<ArcSwap<Config>>) -> Handlers {
         pull_diagnostics,
         pull_all_documents_diagnostics,
         code_action_hint,
+        file_watcher: None,
     };
 
     helix_view::handlers::register_hooks(&handlers);
