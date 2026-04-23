@@ -86,3 +86,31 @@ mod imp {
 }
 
 pub use imp::FileWatcher;
+
+#[cfg(test)]
+mod tests {
+    use super::workspace_root;
+    use std::fs;
+
+    #[test]
+    fn detects_git_directory_as_workspace() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir(tmp.path().join(".git")).unwrap();
+        assert_eq!(workspace_root(tmp.path()).as_deref(), Some(tmp.path()));
+    }
+
+    #[test]
+    fn detects_git_file_as_workspace() {
+        // Submodules and worktrees use a `.git` file pointing at the real gitdir.
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join(".git"), "gitdir: /elsewhere\n").unwrap();
+        assert_eq!(workspace_root(tmp.path()).as_deref(), Some(tmp.path()));
+    }
+
+    #[test]
+    fn rejects_non_workspace_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(workspace_root(tmp.path()), None);
+    }
+}
+
