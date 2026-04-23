@@ -1,4 +1,5 @@
 use completion::{CompletionEvent, CompletionHandler};
+use file_watcher::FileWatcher;
 use helix_event::send_blocking;
 use tokio::sync::mpsc::Sender;
 
@@ -8,6 +9,7 @@ use crate::{DocumentId, Editor, ViewId};
 pub mod completion;
 pub mod dap;
 pub mod diagnostics;
+pub mod file_watcher;
 pub mod lsp;
 pub mod word_index;
 
@@ -27,6 +29,7 @@ pub struct Handlers {
     pub word_index: word_index::Handler,
     pub pull_diagnostics: Sender<lsp::PullDiagnosticsEvent>,
     pub pull_all_documents_diagnostics: Sender<lsp::PullAllDocumentsDiagnosticsEvent>,
+    pub file_watcher: Option<FileWatcher>,
 }
 
 impl Handlers {
