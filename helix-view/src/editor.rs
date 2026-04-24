@@ -1341,7 +1341,12 @@ impl Editor {
         let file_watcher = crate::handlers::file_watcher::workspace_root(
             &helix_stdx::env::current_working_dir(),
         )
-        .and_then(crate::handlers::file_watcher::FileWatcher::start);
+        .and_then(|root| {
+            crate::handlers::file_watcher::FileWatcher::start(
+                root,
+                language_servers.file_event_handler.clone(),
+            )
+        });
 
         // HAXX: offset the render area height by 1 to account for prompt/commandline
         area.height -= 1;
