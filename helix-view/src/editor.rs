@@ -400,6 +400,10 @@ pub struct Config {
     /// This prevents data loss if the editor is interrupted while writing the file, but may
     /// confuse some file watching/hot reloading programs. Defaults to `true`.
     pub atomic_save: bool,
+    /// Whether to reload open buffers when their file changes externally on
+    /// disk. Unmodified buffers are reloaded silently; modified buffers emit
+    /// a status-line warning and are left untouched. Defaults to `true`.
+    pub auto_reload: bool,
     /// Whether to automatically remove all trailing line-endings after the final one on write.
     /// Defaults to `false`.
     pub trim_final_newlines: bool,
@@ -1143,6 +1147,7 @@ impl Default for Config {
             default_line_ending: LineEndingConfig::default(),
             insert_final_newline: true,
             atomic_save: true,
+            auto_reload: true,
             trim_final_newlines: false,
             trim_trailing_whitespace: false,
             smart_tab: Some(SmartTabConfig::default()),
@@ -1209,6 +1214,11 @@ pub struct Editor {
     pub diagnostics: Diagnostics,
     pub diff_providers: DiffProviderRegistry,
     pub file_watcher: Option<crate::handlers::file_watcher::FileWatcher>,
+    /// Kept alive so `file_watcher_events` stays open even when no watcher is
+    /// running (e.g. helix was launched outside a workspace). Clones are
+    /// handed to the watcher's drain task when it starts.
+    _file_watcher_tx: UnboundedSender<crate::handlers::file_watcher::FileWatcherEvent>,
+    file_watcher_events: UnboundedReceiver<crate::handlers::file_watcher::FileWatcherEvent>,
 
     pub debug_adapters: dap::registry::Registry,
     pub breakpoints: HashMap<PathBuf, Vec<Breakpoint>>,
@@ -1270,6 +1280,7 @@ pub enum EditorEvent {
     ConfigEvent(ConfigEvent),
     LanguageServerMessage((LanguageServerId, Call)),
     DebuggerEvent((DebugAdapterId, dap::Payload)),
+    ExternalFileChanged(crate::handlers::file_watcher::FileWatcherEvent),
     IdleTimer,
     Redraw,
 }
@@ -1338,6 +1349,7 @@ impl Editor {
         let conf = config.load();
         let auto_pairs = (&conf.auto_pairs).into();
 
+        let (file_watcher_tx, file_watcher_events) = unbounded_channel();
         let file_watcher = crate::handlers::file_watcher::workspace_root(
             &helix_stdx::env::current_working_dir(),
         )
@@ -1345,6 +1357,7 @@ impl Editor {
             crate::handlers::file_watcher::FileWatcher::start(
                 root,
                 language_servers.file_event_handler.clone(),
+                file_watcher_tx.clone(),
             )
         });
 
@@ -1367,6 +1380,8 @@ impl Editor {
             language_servers,
             diagnostics: Diagnostics::new(),
             file_watcher,
+            _file_watcher_tx: file_watcher_tx,
+            file_watcher_events,
             diff_providers: DiffProviderRegistry::default(),
             debug_adapters: dap::registry::Registry::new(),
             breakpoints: HashMap::new(),
@@ -2315,6 +2330,10 @@ impl Editor {
                     return EditorEvent::DebuggerEvent(event)
                 }
 
+                Some(event) = self.file_watcher_events.recv() => {
+                    return EditorEvent::ExternalFileChanged(event)
+                }
+
                 _ = helix_event::redraw_requested() => {
                     if  !self.needs_redraw{
                         self.needs_redraw = true;
@@ -2332,6 +2351,69 @@ impl Editor {
                 _ = &mut self.idle_timer  => {
                     return EditorEvent::IdleTimer
                 }
+            }
+        }
+    }
+
+    /// Handle an event from the workspace file watcher.
+    ///
+    /// If the changed path has an open buffer and the buffer is clean, reload
+    /// it from disk. If it has unsaved changes, leave it alone and surface a
+    /// status-line warning. Paths with no matching buffer are ignored here
+    /// (LSP fan-out for those happens upstream in the watcher's dispatch).
+    pub fn handle_external_file_changed(
+        &mut self,
+        event: crate::handlers::file_watcher::FileWatcherEvent,
+    ) {
+        use crate::handlers::file_watcher::FileWatcherEvent;
+        let FileWatcherEvent::Modified(path) = event;
+
+        if !self.config().auto_reload {
+            return;
+        }
+
+        let path = helix_stdx::path::canonicalize(&path);
+        let Some(doc_id) = self.document_id_by_path(&path) else {
+            return;
+        };
+
+        let doc = doc!(self, &doc_id);
+        if doc.is_modified() {
+            let name = doc.display_name().into_owned();
+            self.set_status(format!(
+                "{name} changed on disk; buffer has unsaved changes (use :reload to overwrite)"
+            ));
+            return;
+        }
+
+        // `Document::reload` → `apply_inner` indexes `selections[view_id]`,
+        // which panics if the document isn't attached to that view. Either
+        // pick a view the document is already attached to, or attach it to
+        // the currently-focused view first.
+        let focused = self.tree.focus;
+        let view_id = {
+            let doc = doc_mut!(self, &doc_id);
+            if let Some(id) = doc.selections().keys().copied().next() {
+                id
+            } else {
+                doc.ensure_view_init(focused);
+                focused
+            }
+        };
+
+        let scrolloff = self.config().scrolloff;
+        let view = view_mut!(self, view_id);
+        let doc = doc_mut!(self, &doc_id);
+        view.sync_changes(doc);
+
+        match doc.reload(view, &self.diff_providers) {
+            Ok(()) => {
+                view.ensure_cursor_in_view(doc, scrolloff);
+                log::info!("auto-reloaded {}", path.display());
+            }
+            Err(err) => {
+                let name = doc.display_name().into_owned();
+                self.set_error(format!("{name}: {err}"));
             }
         }
     }

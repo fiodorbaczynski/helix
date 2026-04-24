@@ -674,6 +674,10 @@ impl Application {
                     self.render().await;
                 }
             }
+            EditorEvent::ExternalFileChanged(event) => {
+                self.editor.handle_external_file_changed(event);
+                self.render().await;
+            }
             EditorEvent::Redraw => {
                 self.render().await;
             }
