@@ -9,6 +9,16 @@
 
 use std::path::{Path, PathBuf};
 
+/// An external filesystem event that may require the editor to update its
+/// in-memory state. The watcher emits these; the editor consumes them on its
+/// main event loop.
+#[derive(Debug, Clone)]
+pub enum FileWatcherEvent {
+    /// The file's content was likely modified (created, written, or replaced).
+    /// Consumers should reload any buffer whose path matches.
+    Modified(PathBuf),
+}
+
 /// Returns the workspace root if `cwd` is itself a workspace.
 ///
 /// A directory is a workspace iff it directly contains a `.git` entry — regular
@@ -27,9 +37,13 @@ mod imp {
     use std::sync::mpsc;
 
     use ignore::gitignore::{Gitignore, GitignoreBuilder};
+    use notify::event::ModifyKind;
     use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+    use tokio::sync::mpsc::UnboundedSender;
 
     use helix_lsp::file_event;
+
+    use super::FileWatcherEvent;
 
     /// Holds the live FSEvents stream for the workspace.
     ///
@@ -41,12 +55,21 @@ mod imp {
     }
 
     impl FileWatcher {
-        pub fn start(root: PathBuf, lsp_fan_out: file_event::Handler) -> Option<Self> {
-            // FSEvents returns canonical paths (e.g. `/private/var/...` on
-            // macOS). The gitignore matcher panics in debug builds when given
-            // a path that isn't under its configured root, so we canonicalize
-            // the root up front to keep the two forms aligned.
-            let root = std::fs::canonicalize(&root).unwrap_or(root);
+        pub fn start(
+            root: PathBuf,
+            lsp_fan_out: file_event::Handler,
+            editor_tx: UnboundedSender<FileWatcherEvent>,
+        ) -> Option<Self> {
+            // helix stores document paths via `helix_stdx::path::canonicalize`,
+            // which normalises `..`/`.` but does not resolve symlinks.
+            // FSEvents, by contrast, reports events with the symlink-resolved
+            // path (e.g. `/private/var/...` instead of `/var/...` on macOS).
+            // We need both forms: the FS form to pass to notify and to match
+            // ignore rules against, and the helix form to look up open
+            // documents. Event paths are rewritten from the former to the
+            // latter at dispatch time.
+            let helix_root = helix_stdx::path::canonicalize(&root);
+            let fs_root = std::fs::canonicalize(&root).unwrap_or_else(|_| helix_root.clone());
 
             let (tx, rx) = mpsc::channel::<notify::Result<Event>>();
 
@@ -58,16 +81,24 @@ mod imp {
                 }
             };
 
-            if let Err(err) = watcher.watch(&root, RecursiveMode::Recursive) {
-                log::warn!("failed to watch workspace {}: {err}", root.display());
+            if let Err(err) = watcher.watch(&fs_root, RecursiveMode::Recursive) {
+                log::warn!(
+                    "failed to watch workspace {}: {err}",
+                    fs_root.display()
+                );
                 return None;
             }
 
-            let ignore = build_ignore(&root);
+            let ignore = build_ignore(&fs_root);
 
-            log::info!("watching workspace for external changes: {}", root.display());
+            log::info!(
+                "watching workspace for external changes: {}",
+                fs_root.display()
+            );
 
-            tokio::task::spawn_blocking(move || drain(rx, lsp_fan_out, ignore));
+            tokio::task::spawn_blocking(move || {
+                drain(rx, lsp_fan_out, editor_tx, ignore, fs_root, helix_root)
+            });
 
             Some(Self { _watcher: watcher })
         }
@@ -102,31 +133,70 @@ mod imp {
     fn drain(
         rx: mpsc::Receiver<notify::Result<Event>>,
         lsp_fan_out: file_event::Handler,
+        editor_tx: UnboundedSender<FileWatcherEvent>,
         ignore: Gitignore,
+        fs_root: PathBuf,
+        helix_root: PathBuf,
     ) {
         while let Ok(result) = rx.recv() {
             match result {
-                Ok(event) => dispatch(&event, &lsp_fan_out, &ignore),
+                Ok(event) => dispatch(
+                    &event,
+                    &lsp_fan_out,
+                    &editor_tx,
+                    &ignore,
+                    &fs_root,
+                    &helix_root,
+                ),
                 Err(err) => log::warn!("file watcher error: {err}"),
             }
         }
     }
 
-    /// Routes a single notify event to the LSP fan-out registry after filtering.
-    fn dispatch(event: &Event, lsp_fan_out: &file_event::Handler, ignore: &Gitignore) {
+    /// Routes a single notify event to the LSP fan-out registry and, for
+    /// events likely to reflect a content change, also to the editor so it
+    /// can reload matching open buffers.
+    fn dispatch(
+        event: &Event,
+        lsp_fan_out: &file_event::Handler,
+        editor_tx: &UnboundedSender<FileWatcherEvent>,
+        ignore: &Gitignore,
+        fs_root: &Path,
+        helix_root: &Path,
+    ) {
         // Access events never change content; dropping them early avoids a
         // stat-per-event under heavy read traffic.
         if matches!(event.kind, EventKind::Access(_)) {
             return;
         }
 
+        // The LSP fan-out forwards every non-access event (metadata matters
+        // for some servers), but reload is only driven by kinds that can
+        // actually change file contents. Renames and removals are deferred
+        // to a later commit that handles their semantics explicitly.
+        let notify_buffer_reload = match event.kind {
+            EventKind::Modify(ModifyKind::Metadata(_)) => false,
+            EventKind::Modify(ModifyKind::Name(_)) => false,
+            EventKind::Remove(_) => false,
+            _ => true,
+        };
+
         for path in &event.paths {
+            // Ignore matching is done against the FS-form path because the
+            // matcher was built with `fs_root`.
             if is_ignored(ignore, path) {
                 log::trace!("file watcher: ignored {}", path.display());
                 continue;
             }
-            log::trace!("file watcher: forwarding {}", path.display());
-            lsp_fan_out.file_changed(path.clone());
+            let remapped = remap_to_helix_form(path, fs_root, helix_root);
+            log::trace!("file watcher: forwarding {}", remapped.display());
+            lsp_fan_out.file_changed(remapped.clone());
+            if notify_buffer_reload {
+                // `send` only fails if the receiver has been dropped, which
+                // only happens at editor shutdown — losing an event in flight
+                // then is fine.
+                let _ = editor_tx.send(FileWatcherEvent::Modified(remapped));
+            }
         }
     }
 
@@ -135,11 +205,24 @@ mod imp {
             .matched_path_or_any_parents(path, path.is_dir())
             .is_ignore()
     }
+
+    /// Rewrite a path from the FSEvents-reported form (symlinks resolved) to
+    /// the form helix uses for document bookkeeping (symlinks preserved).
+    /// Paths that don't start with `fs_root` are returned unchanged — they're
+    /// outside the watched tree, which shouldn't normally happen but isn't
+    /// worth crashing over.
+    fn remap_to_helix_form(path: &Path, fs_root: &Path, helix_root: &Path) -> PathBuf {
+        match path.strip_prefix(fs_root) {
+            Ok(rel) => helix_root.join(rel),
+            Err(_) => path.to_path_buf(),
+        }
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
 mod imp {
-    use super::PathBuf;
+    use super::{FileWatcherEvent, PathBuf};
+    use tokio::sync::mpsc::UnboundedSender;
 
     pub struct FileWatcher;
 
@@ -147,6 +230,7 @@ mod imp {
         pub fn start(
             _root: PathBuf,
             _lsp_fan_out: helix_lsp::file_event::Handler,
+            _editor_tx: UnboundedSender<FileWatcherEvent>,
         ) -> Option<Self> {
             None
         }
