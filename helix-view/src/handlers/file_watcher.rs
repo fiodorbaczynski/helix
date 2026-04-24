@@ -23,10 +23,13 @@ pub fn workspace_root(cwd: &Path) -> Option<PathBuf> {
 
 #[cfg(target_os = "macos")]
 mod imp {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::mpsc;
 
-    use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
+    use ignore::gitignore::{Gitignore, GitignoreBuilder};
+    use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+
+    use helix_lsp::file_event;
 
     /// Holds the live FSEvents stream for the workspace.
     ///
@@ -38,7 +41,13 @@ mod imp {
     }
 
     impl FileWatcher {
-        pub fn start(root: PathBuf) -> Option<Self> {
+        pub fn start(root: PathBuf, lsp_fan_out: file_event::Handler) -> Option<Self> {
+            // FSEvents returns canonical paths (e.g. `/private/var/...` on
+            // macOS). The gitignore matcher panics in debug builds when given
+            // a path that isn't under its configured root, so we canonicalize
+            // the root up front to keep the two forms aligned.
+            let root = std::fs::canonicalize(&root).unwrap_or(root);
+
             let (tx, rx) = mpsc::channel::<notify::Result<Event>>();
 
             let mut watcher = match RecommendedWatcher::new(tx, Config::default()) {
@@ -54,21 +63,77 @@ mod imp {
                 return None;
             }
 
+            let ignore = build_ignore(&root);
+
             log::info!("watching workspace for external changes: {}", root.display());
 
-            tokio::task::spawn_blocking(move || drain(rx));
+            tokio::task::spawn_blocking(move || drain(rx, lsp_fan_out, ignore));
 
             Some(Self { _watcher: watcher })
         }
     }
 
-    fn drain(rx: mpsc::Receiver<notify::Result<Event>>) {
+    /// Build a gitignore matcher for the workspace root.
+    ///
+    /// Only root-level ignore files are loaded — nested `.gitignore`s in
+    /// subdirectories are not consulted. This is good enough for the common
+    /// cases (build outputs, vendored deps) and keeps startup cheap on large
+    /// trees. `.git/` is added unconditionally so we never forward events from
+    /// inside the git directory.
+    fn build_ignore(root: &Path) -> Gitignore {
+        let mut builder = GitignoreBuilder::new(root);
+        for name in [".gitignore", ".ignore", ".helix/ignore"] {
+            let path = root.join(name);
+            if path.exists() {
+                if let Some(err) = builder.add(path) {
+                    log::warn!("ignore file for file watcher: {err}");
+                }
+            }
+        }
+        if let Err(err) = builder.add_line(None, ".git/") {
+            log::warn!("ignore rule for file watcher: {err}");
+        }
+        builder.build().unwrap_or_else(|err| {
+            log::warn!("gitignore build failed, proceeding without ignore rules: {err}");
+            Gitignore::empty()
+        })
+    }
+
+    fn drain(
+        rx: mpsc::Receiver<notify::Result<Event>>,
+        lsp_fan_out: file_event::Handler,
+        ignore: Gitignore,
+    ) {
         while let Ok(result) = rx.recv() {
             match result {
-                Ok(event) => log::trace!("fs event: {event:?}"),
+                Ok(event) => dispatch(&event, &lsp_fan_out, &ignore),
                 Err(err) => log::warn!("file watcher error: {err}"),
             }
         }
+    }
+
+    /// Routes a single notify event to the LSP fan-out registry after filtering.
+    fn dispatch(event: &Event, lsp_fan_out: &file_event::Handler, ignore: &Gitignore) {
+        // Access events never change content; dropping them early avoids a
+        // stat-per-event under heavy read traffic.
+        if matches!(event.kind, EventKind::Access(_)) {
+            return;
+        }
+
+        for path in &event.paths {
+            if is_ignored(ignore, path) {
+                log::trace!("file watcher: ignored {}", path.display());
+                continue;
+            }
+            log::trace!("file watcher: forwarding {}", path.display());
+            lsp_fan_out.file_changed(path.clone());
+        }
+    }
+
+    fn is_ignored(ignore: &Gitignore, path: &Path) -> bool {
+        ignore
+            .matched_path_or_any_parents(path, path.is_dir())
+            .is_ignore()
     }
 }
 
@@ -79,7 +144,10 @@ mod imp {
     pub struct FileWatcher;
 
     impl FileWatcher {
-        pub fn start(_root: PathBuf) -> Option<Self> {
+        pub fn start(
+            _root: PathBuf,
+            _lsp_fan_out: helix_lsp::file_event::Handler,
+        ) -> Option<Self> {
             None
         }
     }
@@ -113,4 +181,3 @@ mod tests {
         assert_eq!(workspace_root(tmp.path()), None);
     }
 }
-
