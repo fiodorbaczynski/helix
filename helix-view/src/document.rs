@@ -207,6 +207,12 @@ pub struct Document {
 
     pub readonly: bool,
 
+    /// Set when the workspace file watcher reports the file was removed
+    /// from disk while the buffer was dirty. Cleared by a successful save
+    /// (which re-creates the file). Surfaced by the statusline as `[!]`.
+    /// Clean buffers are auto-closed on removal and never reach this state.
+    pub deleted_on_disk: bool,
+
     pub previous_diagnostic_ids: HashMap<LanguageServerId, String>,
 
     /// Annotations for LSP document color swatches
@@ -754,6 +760,7 @@ impl Document {
             version_control_head: None,
             focused_at: std::time::Instant::now(),
             readonly: false,
+            deleted_on_disk: false,
             jump_labels: HashMap::new(),
             document_highlights: HashMap::new(),
             color_swatches: None,
@@ -1842,6 +1849,8 @@ impl Document {
         );
         self.last_saved_revision = rev;
         self.last_saved_time = save_time;
+        // A successful save re-creates the file on disk if it was missing.
+        self.deleted_on_disk = false;
     }
 
     /// Get the document's latest saved revision.
