@@ -6,19 +6,25 @@
 //! unsaved changes, and what to surface in the status line. The reload
 //! mechanics themselves live on `Editor::reload_document`.
 
+use std::path::PathBuf;
+
 use helix_view::handlers::file_watcher::FileWatcherEvent;
-use helix_view::Editor;
+use helix_view::{DocumentId, Editor};
 
 /// Handle one external filesystem event.
 pub fn handle(event: FileWatcherEvent, editor: &mut Editor) {
-    let FileWatcherEvent::Modified(path) = event;
-
     if !editor.config().auto_reload {
         return;
     }
 
-    let path = helix_stdx::path::canonicalize(&path);
-    let Some(doc_id) = editor.document_id_by_path(&path) else {
+    match event {
+        FileWatcherEvent::Modified(path) => handle_modified(path, editor),
+        FileWatcherEvent::Removed(path) => handle_removed(path, editor),
+    }
+}
+
+fn handle_modified(path: PathBuf, editor: &mut Editor) {
+    let Some((doc_id, path)) = lookup(path, editor) else {
         return;
     };
 
@@ -36,4 +42,34 @@ pub fn handle(event: FileWatcherEvent, editor: &mut Editor) {
         Ok(()) => log::info!("auto-reloaded {}", path.display()),
         Err(err) => editor.set_error(format!("{name}: {err}")),
     }
+}
+
+fn handle_removed(path: PathBuf, editor: &mut Editor) {
+    let Some((doc_id, path)) = lookup(path, editor) else {
+        return;
+    };
+
+    let doc = doc_mut!(editor, &doc_id);
+    if doc.is_modified() {
+        // Dirty buffer: keep its contents in memory, flag it so the
+        // statusline can warn the user their disk state is gone.
+        doc.deleted_on_disk = true;
+        log::info!("external delete with unsaved changes: {}", path.display());
+        return;
+    }
+
+    // Clean buffer: nothing to lose, close it. The two error cases —
+    // `DoesNotExist` and `BufferModified` — are unreachable here because we
+    // just looked the doc up and confirmed it isn't dirty.
+    if editor.close_document(doc_id, false).is_err() {
+        unreachable!("close_document on freshly-checked clean buffer");
+    }
+    log::info!("auto-closed externally removed {}", path.display());
+}
+
+/// Resolve an event path to a `(DocumentId, canonical_path)` if a buffer
+/// is currently open for it. The canonical path is returned for logging.
+fn lookup(path: PathBuf, editor: &Editor) -> Option<(DocumentId, PathBuf)> {
+    let path = helix_stdx::path::canonicalize(&path);
+    editor.document_id_by_path(&path).map(|id| (id, path))
 }
