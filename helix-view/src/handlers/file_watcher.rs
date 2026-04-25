@@ -17,6 +17,10 @@ pub enum FileWatcherEvent {
     /// The file's content was likely modified (created, written, or replaced).
     /// Consumers should reload any buffer whose path matches.
     Modified(PathBuf),
+    /// The file was removed from disk. Consumers should close any clean
+    /// buffer whose path matches; dirty buffers should be flagged so the
+    /// user notices their disk state has gone away.
+    Removed(PathBuf),
 }
 
 /// Returns the workspace root if `cwd` is itself a workspace.
@@ -153,9 +157,8 @@ mod imp {
         }
     }
 
-    /// Routes a single notify event to the LSP fan-out registry and, for
-    /// events likely to reflect a content change, also to the editor so it
-    /// can reload matching open buffers.
+    /// Routes a single notify event to the LSP fan-out registry and, when
+    /// the event's kind has buffer-level semantics, also to the editor.
     fn dispatch(
         event: &Event,
         lsp_fan_out: &file_event::Handler,
@@ -171,14 +174,14 @@ mod imp {
         }
 
         // The LSP fan-out forwards every non-access event (metadata matters
-        // for some servers), but reload is only driven by kinds that can
-        // actually change file contents. Renames and removals are deferred
-        // to a later commit that handles their semantics explicitly.
-        let notify_buffer_reload = match event.kind {
-            EventKind::Modify(ModifyKind::Metadata(_)) => false,
-            EventKind::Modify(ModifyKind::Name(_)) => false,
-            EventKind::Remove(_) => false,
-            _ => true,
+        // for some servers), but the editor only cares about kinds with
+        // observable buffer-level semantics. Renames are deferred to a later
+        // commit; metadata-only changes never warrant a reload.
+        let make_editor_event: Option<fn(PathBuf) -> FileWatcherEvent> = match event.kind {
+            EventKind::Modify(ModifyKind::Metadata(_)) => None,
+            EventKind::Modify(ModifyKind::Name(_)) => None,
+            EventKind::Remove(_) => Some(FileWatcherEvent::Removed),
+            _ => Some(FileWatcherEvent::Modified),
         };
 
         for path in &event.paths {
@@ -188,14 +191,21 @@ mod imp {
                 log::trace!("file watcher: ignored {}", path.display());
                 continue;
             }
+            // FSEvents replays historical events on workspace open. A Remove
+            // for a path that still exists is a stale replay — drop it so we
+            // don't tell consumers a live file vanished.
+            if matches!(event.kind, EventKind::Remove(_)) && path.exists() {
+                log::trace!("file watcher: dropping stale Remove for {}", path.display());
+                continue;
+            }
             let remapped = remap_to_helix_form(path, fs_root, helix_root);
             log::trace!("file watcher: forwarding {}", remapped.display());
             lsp_fan_out.file_changed(remapped.clone());
-            if notify_buffer_reload {
+            if let Some(make_event) = make_editor_event {
                 // `send` only fails if the receiver has been dropped, which
                 // only happens at editor shutdown — losing an event in flight
                 // then is fine.
-                let _ = editor_tx.send(FileWatcherEvent::Modified(remapped));
+                let _ = editor_tx.send(make_event(remapped));
             }
         }
     }
