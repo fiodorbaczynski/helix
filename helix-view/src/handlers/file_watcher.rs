@@ -21,6 +21,12 @@ pub enum FileWatcherEvent {
     /// buffer whose path matches; dirty buffers should be flagged so the
     /// user notices their disk state has gone away.
     Removed(PathBuf),
+    /// The file was renamed from `from` to `to` within the watched tree.
+    /// Consumers should redirect any buffer at `from` to `to` so the
+    /// editor's view follows the file. Renames that cross the watched
+    /// boundary in either direction never produce this variant — the
+    /// watcher emits `Removed` (renamed out) or `Modified` (renamed in).
+    Renamed { from: PathBuf, to: PathBuf },
 }
 
 /// Returns the workspace root if `cwd` is itself a workspace.
@@ -38,7 +44,8 @@ pub fn workspace_root(cwd: &Path) -> Option<PathBuf> {
 #[cfg(target_os = "macos")]
 mod imp {
     use std::path::{Path, PathBuf};
-    use std::sync::mpsc;
+    use std::sync::mpsc::{self, RecvTimeoutError};
+    use std::time::{Duration, Instant};
 
     use ignore::gitignore::{Gitignore, GitignoreBuilder};
     use notify::event::ModifyKind;
@@ -48,6 +55,22 @@ mod imp {
     use helix_lsp::file_event;
 
     use super::FileWatcherEvent;
+
+    /// FSEvents on macOS reports the two ends of a rename as separate
+    /// `Modify(Name(Any))` events, with no built-in pairing. We buffer one
+    /// half and wait briefly for its counterpart; if no counterpart arrives
+    /// the half is flushed as a `Removed` (source) or `Modified`
+    /// (destination) — that covers renames crossing the workspace boundary.
+    const RENAME_PAIRING_WINDOW: Duration = Duration::from_millis(100);
+
+    /// One half of an in-flight rename. `is_source` is determined by the
+    /// path's existence at receipt: source paths no longer exist, target
+    /// paths do.
+    struct PendingRename {
+        helix_path: PathBuf,
+        received_at: Instant,
+        is_source: bool,
+    }
 
     /// Holds the live FSEvents stream for the workspace.
     ///
@@ -142,17 +165,36 @@ mod imp {
         fs_root: PathBuf,
         helix_root: PathBuf,
     ) {
-        while let Ok(result) = rx.recv() {
-            match result {
-                Ok(event) => dispatch(
+        let mut pending: Option<PendingRename> = None;
+
+        loop {
+            // While a half-rename is buffered, only block until its window
+            // expires; otherwise wait indefinitely for the next event.
+            let received = match pending.as_ref() {
+                Some(p) => {
+                    let remaining = RENAME_PAIRING_WINDOW.saturating_sub(p.received_at.elapsed());
+                    rx.recv_timeout(remaining)
+                }
+                None => rx.recv().map_err(|_| RecvTimeoutError::Disconnected),
+            };
+
+            match received {
+                Ok(Ok(event)) => dispatch(
                     &event,
+                    &mut pending,
                     &lsp_fan_out,
                     &editor_tx,
                     &ignore,
                     &fs_root,
                     &helix_root,
                 ),
-                Err(err) => log::warn!("file watcher error: {err}"),
+                Ok(Err(err)) => log::warn!("file watcher error: {err}"),
+                Err(RecvTimeoutError::Timeout) => {
+                    if let Some(p) = pending.take() {
+                        flush_orphan(p, &editor_tx);
+                    }
+                }
+                Err(RecvTimeoutError::Disconnected) => break,
             }
         }
     }
@@ -161,6 +203,7 @@ mod imp {
     /// the event's kind has buffer-level semantics, also to the editor.
     fn dispatch(
         event: &Event,
+        pending: &mut Option<PendingRename>,
         lsp_fan_out: &file_event::Handler,
         editor_tx: &UnboundedSender<FileWatcherEvent>,
         ignore: &Gitignore,
@@ -175,8 +218,10 @@ mod imp {
 
         // The LSP fan-out forwards every non-access event (metadata matters
         // for some servers), but the editor only cares about kinds with
-        // observable buffer-level semantics. Renames are deferred to a later
-        // commit; metadata-only changes never warrant a reload.
+        // observable buffer-level semantics. Name events are routed through
+        // the rename pairing layer; metadata-only changes never warrant a
+        // reload.
+        let is_name = matches!(event.kind, EventKind::Modify(ModifyKind::Name(_)));
         let make_editor_event: Option<fn(PathBuf) -> FileWatcherEvent> = match event.kind {
             EventKind::Modify(ModifyKind::Metadata(_)) => None,
             EventKind::Modify(ModifyKind::Name(_)) => None,
@@ -201,13 +246,66 @@ mod imp {
             let remapped = remap_to_helix_form(path, fs_root, helix_root);
             log::trace!("file watcher: forwarding {}", remapped.display());
             lsp_fan_out.file_changed(remapped.clone());
-            if let Some(make_event) = make_editor_event {
+
+            if is_name {
+                let is_source = !path.exists();
+                let arrived = PendingRename {
+                    helix_path: remapped,
+                    received_at: Instant::now(),
+                    is_source,
+                };
+                *pending = pair_or_buffer(arrived, pending.take(), editor_tx);
+            } else if let Some(make_event) = make_editor_event {
                 // `send` only fails if the receiver has been dropped, which
                 // only happens at editor shutdown — losing an event in flight
                 // then is fine.
                 let _ = editor_tx.send(make_event(remapped));
             }
         }
+    }
+
+    /// Try to pair a freshly-arrived Name half with whatever was buffered.
+    ///
+    /// Outcomes:
+    /// - opposite-side pair: emit `Renamed` and clear the slot;
+    /// - same-side collision: flush the older half as an orphan and keep
+    ///   the new one (the older one's counterpart isn't coming);
+    /// - empty slot: store the new half.
+    fn pair_or_buffer(
+        arrived: PendingRename,
+        previous: Option<PendingRename>,
+        editor_tx: &UnboundedSender<FileWatcherEvent>,
+    ) -> Option<PendingRename> {
+        match previous {
+            Some(prev) if prev.is_source != arrived.is_source => {
+                let (from, to) = if prev.is_source {
+                    (prev.helix_path, arrived.helix_path)
+                } else {
+                    (arrived.helix_path, prev.helix_path)
+                };
+                let _ = editor_tx.send(FileWatcherEvent::Renamed { from, to });
+                None
+            }
+            Some(prev) => {
+                flush_orphan(prev, editor_tx);
+                Some(arrived)
+            }
+            None => Some(arrived),
+        }
+    }
+
+    /// Emit a buffered half-rename as if it were a one-sided event. A
+    /// stranded source means the file was renamed away (likely out of the
+    /// workspace) — that's a removal from our perspective. A stranded
+    /// destination means the file appeared (likely renamed in from outside)
+    /// — semantically a modification of that path.
+    fn flush_orphan(p: PendingRename, editor_tx: &UnboundedSender<FileWatcherEvent>) {
+        let event = if p.is_source {
+            FileWatcherEvent::Removed(p.helix_path)
+        } else {
+            FileWatcherEvent::Modified(p.helix_path)
+        };
+        let _ = editor_tx.send(event);
     }
 
     fn is_ignored(ignore: &Gitignore, path: &Path) -> bool {
