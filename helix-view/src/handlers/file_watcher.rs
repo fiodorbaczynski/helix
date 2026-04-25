@@ -65,6 +65,11 @@ mod imp {
     /// (destination) — that covers renames crossing the workspace boundary.
     const RENAME_PAIRING_WINDOW: Duration = Duration::from_millis(100);
 
+    /// Quiet window after a `.gitignore` / `.ignore` change before we
+    /// rebuild the matcher. A burst of related events (write-temp +
+    /// rename, multi-file save) coalesces into a single rebuild.
+    const IGNORE_REBUILD_DEBOUNCE: Duration = Duration::from_millis(100);
+
     /// One half of an in-flight rename. `is_source` is determined by the
     /// path's existence at receipt: source paths no longer exist, target
     /// paths do.
@@ -72,6 +77,15 @@ mod imp {
         helix_path: PathBuf,
         received_at: Instant,
         is_source: bool,
+    }
+
+    /// Mutable state that crosses dispatch calls within a drain loop:
+    /// the in-flight rename half and the deadline at which the next
+    /// gitignore rebuild is due.
+    #[derive(Default)]
+    struct DispatchState {
+        pending_rename: Option<PendingRename>,
+        rebuild_due: Option<Instant>,
     }
 
     /// Holds the live FSEvents stream for the workspace.
@@ -256,19 +270,31 @@ mod imp {
         rx: mpsc::Receiver<notify::Result<Event>>,
         lsp_fan_out: file_event::Handler,
         editor_tx: UnboundedSender<FileWatcherEvent>,
-        ignore: HierarchicalIgnore,
+        mut ignore: HierarchicalIgnore,
         fs_root: PathBuf,
         helix_root: PathBuf,
     ) {
-        let mut pending: Option<PendingRename> = None;
+        let mut state = DispatchState::default();
 
         loop {
-            // While a half-rename is buffered, only block until its window
-            // expires; otherwise wait indefinitely for the next event.
-            let received = match pending.as_ref() {
-                Some(p) => {
-                    let remaining = RENAME_PAIRING_WINDOW.saturating_sub(p.received_at.elapsed());
-                    rx.recv_timeout(remaining)
+            // Block only until the nearest pending deadline (rename
+            // pairing or gitignore rebuild). With nothing pending, wait
+            // indefinitely for the next event.
+            let next_deadline = [
+                state
+                    .pending_rename
+                    .as_ref()
+                    .map(|p| p.received_at + RENAME_PAIRING_WINDOW),
+                state.rebuild_due,
+            ]
+            .into_iter()
+            .flatten()
+            .min();
+
+            let received = match next_deadline {
+                Some(deadline) => {
+                    let timeout = deadline.saturating_duration_since(Instant::now());
+                    rx.recv_timeout(timeout)
                 }
                 None => rx.recv().map_err(|_| RecvTimeoutError::Disconnected),
             };
@@ -276,7 +302,7 @@ mod imp {
             match received {
                 Ok(Ok(event)) => dispatch(
                     &event,
-                    &mut pending,
+                    &mut state,
                     &lsp_fan_out,
                     &editor_tx,
                     &ignore,
@@ -285,8 +311,23 @@ mod imp {
                 ),
                 Ok(Err(err)) => log::warn!("file watcher error: {err}"),
                 Err(RecvTimeoutError::Timeout) => {
-                    if let Some(p) = pending.take() {
+                    let now = Instant::now();
+                    if let Some(p) = state
+                        .pending_rename
+                        .take_if(|p| p.received_at + RENAME_PAIRING_WINDOW <= now)
+                    {
                         flush_orphan(p, &editor_tx);
+                    }
+                    if state.rebuild_due.is_some_and(|d| d <= now) {
+                        state.rebuild_due = None;
+                        // Synchronous rebuild on the drain task: events
+                        // arriving during the walk queue up in `rx` and
+                        // are processed once we return. Acceptable for
+                        // typical workspace sizes; if rebuild latency
+                        // becomes a concern, this could move to a
+                        // separate `spawn_blocking` with `ArcSwap`.
+                        log::info!("rebuilding gitignore matcher");
+                        ignore = build_ignore(&fs_root);
                     }
                 }
                 Err(RecvTimeoutError::Disconnected) => break,
@@ -298,7 +339,7 @@ mod imp {
     /// the event's kind has buffer-level semantics, also to the editor.
     fn dispatch(
         event: &Event,
-        pending: &mut Option<PendingRename>,
+        state: &mut DispatchState,
         lsp_fan_out: &file_event::Handler,
         editor_tx: &UnboundedSender<FileWatcherEvent>,
         ignore: &HierarchicalIgnore,
@@ -325,6 +366,16 @@ mod imp {
         };
 
         for path in &event.paths {
+            // A change to an ignore file invalidates the matcher; schedule
+            // a rebuild *before* the ignore check so the gitignore file's
+            // own event isn't filtered out by stale rules. The check runs
+            // for every path regardless of event kind: Create, Modify(Data),
+            // Modify(Name), and Remove all change the active rule set.
+            if is_ignore_file(path) {
+                state.rebuild_due = Some(Instant::now() + IGNORE_REBUILD_DEBOUNCE);
+                log::trace!("file watcher: ignore-file change scheduled rebuild");
+            }
+
             // Ignore matching is done against the FS-form path because the
             // matchers were built rooted in `fs_root` (and its descendants).
             if ignore.matches(path) {
@@ -349,13 +400,32 @@ mod imp {
                     received_at: Instant::now(),
                     is_source,
                 };
-                *pending = pair_or_buffer(arrived, pending.take(), editor_tx);
+                state.pending_rename =
+                    pair_or_buffer(arrived, state.pending_rename.take(), editor_tx);
             } else if let Some(make_event) = make_editor_event {
                 // `send` only fails if the receiver has been dropped, which
                 // only happens at editor shutdown — losing an event in flight
                 // then is fine.
                 let _ = editor_tx.send(make_event(remapped));
             }
+        }
+    }
+
+    /// True if `path`'s file name identifies it as an ignore file the
+    /// matcher should track: standard `.gitignore` / `.ignore`, or the
+    /// workspace-level `.helix/ignore`.
+    fn is_ignore_file(path: &Path) -> bool {
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            return false;
+        };
+        match name {
+            ".gitignore" | ".ignore" => true,
+            "ignore" => path
+                .parent()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+                == Some(".helix"),
+            _ => false,
         }
     }
 
@@ -476,6 +546,21 @@ mod imp {
 
             assert!(ignore.matches(&root.join(".git/HEAD")));
             assert!(ignore.matches(&root.join(".git/objects/pack")));
+        }
+
+        #[test]
+        fn identifies_ignore_files() {
+            assert!(is_ignore_file(Path::new("/repo/.gitignore")));
+            assert!(is_ignore_file(Path::new("/repo/sub/.gitignore")));
+            assert!(is_ignore_file(Path::new("/repo/.ignore")));
+            assert!(is_ignore_file(Path::new("/repo/.helix/ignore")));
+
+            // `ignore` outside `.helix/` is a regular filename.
+            assert!(!is_ignore_file(Path::new("/repo/ignore")));
+            assert!(!is_ignore_file(Path::new("/repo/sub/ignore")));
+            // Other file types aren't ignore files.
+            assert!(!is_ignore_file(Path::new("/repo/main.rs")));
+            assert!(!is_ignore_file(Path::new("/repo/.gitattributes")));
         }
     }
 }
