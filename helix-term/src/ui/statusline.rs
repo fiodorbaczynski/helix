@@ -478,11 +478,15 @@ fn render_file_modification_indicator<'a, F>(context: &mut RenderContext<'a>, wr
 where
     F: Fn(&mut RenderContext<'a>, Span<'a>) + Copy,
 {
-    // `deleted_on_disk` is only set on dirty buffers (clean ones get
-    // auto-closed on removal), so the `[!]` case is a strict superset of
-    // `[+]` and wins the indicator slot.
+    // Both `deleted_on_disk` and `disk_changed_unresolved` are only set on
+    // dirty buffers (clean ones get auto-reloaded or auto-closed), so the
+    // disk-state indicators are strict supersets of `[+]` and take the
+    // slot. Deletion outranks divergence: a missing file is a stronger
+    // statement than a different one.
     let title = if context.doc.deleted_on_disk {
         "[!]"
+    } else if context.doc.disk_changed_unresolved {
+        "[≠]"
     } else if context.doc.is_modified() {
         "[+]"
     } else {
