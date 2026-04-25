@@ -2355,41 +2355,18 @@ impl Editor {
         }
     }
 
-    /// Handle an event from the workspace file watcher.
+    /// Reload an open document from disk.
     ///
-    /// If the changed path has an open buffer and the buffer is clean, reload
-    /// it from disk. If it has unsaved changes, leave it alone and surface a
-    /// status-line warning. Paths with no matching buffer are ignored here
-    /// (LSP fan-out for those happens upstream in the watcher's dispatch).
-    pub fn handle_external_file_changed(
-        &mut self,
-        event: crate::handlers::file_watcher::FileWatcherEvent,
-    ) {
-        use crate::handlers::file_watcher::FileWatcherEvent;
-        let FileWatcherEvent::Modified(path) = event;
-
-        if !self.config().auto_reload {
-            return;
-        }
-
-        let path = helix_stdx::path::canonicalize(&path);
-        let Some(doc_id) = self.document_id_by_path(&path) else {
-            return;
-        };
-
-        let doc = doc!(self, &doc_id);
-        if doc.is_modified() {
-            let name = doc.display_name().into_owned();
-            self.set_status(format!(
-                "{name} changed on disk; buffer has unsaved changes (use :reload to overwrite)"
-            ));
-            return;
-        }
-
-        // `Document::reload` → `apply_inner` indexes `selections[view_id]`,
-        // which panics if the document isn't attached to that view. Either
-        // pick a view the document is already attached to, or attach it to
-        // the currently-focused view first.
+    /// `Document::reload` ultimately calls `apply_inner`, which indexes
+    /// `selections[view_id]` and panics if the document isn't attached to
+    /// that view. Background buffers (the typical external-change case) may
+    /// not be attached to the focused view, so this picks an existing
+    /// attached view if any, otherwise attaches the document to the
+    /// currently-focused view first.
+    ///
+    /// Pure mechanics: no config gate, no dirty-buffer check, no status or
+    /// error reporting. Callers decide policy and surface results.
+    pub fn reload_document(&mut self, doc_id: DocumentId) -> Result<(), Error> {
         let focused = self.tree.focus;
         let view_id = {
             let doc = doc_mut!(self, &doc_id);
@@ -2406,16 +2383,9 @@ impl Editor {
         let doc = doc_mut!(self, &doc_id);
         view.sync_changes(doc);
 
-        match doc.reload(view, &self.diff_providers) {
-            Ok(()) => {
-                view.ensure_cursor_in_view(doc, scrolloff);
-                log::info!("auto-reloaded {}", path.display());
-            }
-            Err(err) => {
-                let name = doc.display_name().into_owned();
-                self.set_error(format!("{name}: {err}"));
-            }
-        }
+        doc.reload(view, &self.diff_providers)?;
+        view.ensure_cursor_in_view(doc, scrolloff);
+        Ok(())
     }
 
     pub async fn flush_writes(&mut self) -> anyhow::Result<()> {
