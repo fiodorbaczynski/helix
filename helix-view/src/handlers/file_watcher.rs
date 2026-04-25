@@ -43,11 +43,13 @@ pub fn workspace_root(cwd: &Path) -> Option<PathBuf> {
 
 #[cfg(target_os = "macos")]
 mod imp {
+    use std::collections::HashMap;
     use std::path::{Path, PathBuf};
     use std::sync::mpsc::{self, RecvTimeoutError};
     use std::time::{Duration, Instant};
 
     use ignore::gitignore::{Gitignore, GitignoreBuilder};
+    use ignore::{Match, WalkBuilder};
     use notify::event::ModifyKind;
     use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
     use tokio::sync::mpsc::UnboundedSender;
@@ -131,37 +133,130 @@ mod imp {
         }
     }
 
-    /// Build a gitignore matcher for the workspace root.
+    /// A collection of per-directory `Gitignore` matchers covering the
+    /// workspace tree, queried hierarchically (deepest matcher wins).
     ///
-    /// Only root-level ignore files are loaded — nested `.gitignore`s in
-    /// subdirectories are not consulted. This is good enough for the common
-    /// cases (build outputs, vendored deps) and keeps startup cheap on large
-    /// trees. `.git/` is added unconditionally so we never forward events from
-    /// inside the git directory.
-    fn build_ignore(root: &Path) -> Gitignore {
-        let mut builder = GitignoreBuilder::new(root);
+    /// A single `Gitignore` rooted at the workspace top doesn't honour
+    /// nested gitignore scoping correctly: patterns from `/sub/.gitignore`
+    /// would be matched against the workspace root rather than against
+    /// `/sub`. Storing one matcher per gitignore-bearing directory keeps
+    /// patterns scoped to where they were declared.
+    struct HierarchicalIgnore {
+        matchers: HashMap<PathBuf, Gitignore>,
+        root: PathBuf,
+    }
+
+    impl HierarchicalIgnore {
+        /// Returns true if the given path is ignored. Walks up from the
+        /// path's parent through the workspace root, querying each
+        /// directory that has a matcher; the first non-`None` result wins.
+        fn matches(&self, path: &Path) -> bool {
+            let mut current = path.parent();
+            while let Some(dir) = current {
+                if let Some(matcher) = self.matchers.get(dir) {
+                    match matcher.matched_path_or_any_parents(path, path.is_dir()) {
+                        Match::Ignore(_) => return true,
+                        Match::Whitelist(_) => return false,
+                        Match::None => {}
+                    }
+                }
+                if dir == self.root {
+                    break;
+                }
+                current = dir.parent();
+            }
+            false
+        }
+    }
+
+    /// Build the hierarchical ignore matcher for the workspace.
+    ///
+    /// Loads `.gitignore` and `.ignore` from every directory under `root`
+    /// (skipping subtrees that ignore rules already exclude), plus the
+    /// workspace-level `.helix/ignore` at the root. `.git/` is added
+    /// unconditionally so we never forward events from inside the git
+    /// directory.
+    fn build_ignore(root: &Path) -> HierarchicalIgnore {
+        let mut builders: HashMap<PathBuf, GitignoreBuilder> = HashMap::new();
+
+        // Root entry: standard ignore files plus the workspace-level
+        // `.helix/ignore` (Helix convention) and the unconditional .git/
+        // block. `.helix/ignore` is workspace-wide, not per-directory.
+        let root_builder = builders
+            .entry(root.to_path_buf())
+            .or_insert_with(|| GitignoreBuilder::new(root));
         for name in [".gitignore", ".ignore", ".helix/ignore"] {
             let path = root.join(name);
             if path.exists() {
-                if let Some(err) = builder.add(path) {
-                    log::warn!("ignore file for file watcher: {err}");
+                if let Some(err) = root_builder.add(&path) {
+                    log::warn!("ignore file {}: {err}", path.display());
                 }
             }
         }
-        if let Err(err) = builder.add_line(None, ".git/") {
-            log::warn!("ignore rule for file watcher: {err}");
+        if let Err(err) = root_builder.add_line(None, ".git/") {
+            log::warn!("ignore rule for .git/: {err}");
         }
-        builder.build().unwrap_or_else(|err| {
-            log::warn!("gitignore build failed, proceeding without ignore rules: {err}");
-            Gitignore::empty()
-        })
+
+        // `WalkBuilder::hidden(false)` is required so the walker yields
+        // dotfiles — including the `.gitignore` files we're trying to
+        // collect. The walker itself respects the ignore rules it
+        // discovers, so subtrees pruned by an ancestor's rules are skipped
+        // automatically.
+        let walker = WalkBuilder::new(root).hidden(false).build();
+        for entry in walker {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(err) => {
+                    log::warn!("file watcher walk: {err}");
+                    continue;
+                }
+            };
+            let path = entry.path();
+            let name = match path.file_name().and_then(|n| n.to_str()) {
+                Some(name) => name,
+                None => continue,
+            };
+            if name != ".gitignore" && name != ".ignore" {
+                continue;
+            }
+            let parent = match path.parent() {
+                Some(parent) => parent,
+                None => continue,
+            };
+            // Root-level files were already added above.
+            if parent == root {
+                continue;
+            }
+            let builder = builders
+                .entry(parent.to_path_buf())
+                .or_insert_with(|| GitignoreBuilder::new(parent));
+            if let Some(err) = builder.add(path) {
+                log::warn!("nested ignore {}: {err}", path.display());
+            }
+        }
+
+        let matchers = builders
+            .into_iter()
+            .filter_map(|(dir, builder)| match builder.build() {
+                Ok(matcher) => Some((dir, matcher)),
+                Err(err) => {
+                    log::warn!("gitignore build for {} failed: {err}", dir.display());
+                    None
+                }
+            })
+            .collect();
+
+        HierarchicalIgnore {
+            matchers,
+            root: root.to_path_buf(),
+        }
     }
 
     fn drain(
         rx: mpsc::Receiver<notify::Result<Event>>,
         lsp_fan_out: file_event::Handler,
         editor_tx: UnboundedSender<FileWatcherEvent>,
-        ignore: Gitignore,
+        ignore: HierarchicalIgnore,
         fs_root: PathBuf,
         helix_root: PathBuf,
     ) {
@@ -206,7 +301,7 @@ mod imp {
         pending: &mut Option<PendingRename>,
         lsp_fan_out: &file_event::Handler,
         editor_tx: &UnboundedSender<FileWatcherEvent>,
-        ignore: &Gitignore,
+        ignore: &HierarchicalIgnore,
         fs_root: &Path,
         helix_root: &Path,
     ) {
@@ -231,8 +326,8 @@ mod imp {
 
         for path in &event.paths {
             // Ignore matching is done against the FS-form path because the
-            // matcher was built with `fs_root`.
-            if is_ignored(ignore, path) {
+            // matchers were built rooted in `fs_root` (and its descendants).
+            if ignore.matches(path) {
                 log::trace!("file watcher: ignored {}", path.display());
                 continue;
             }
@@ -308,12 +403,6 @@ mod imp {
         let _ = editor_tx.send(event);
     }
 
-    fn is_ignored(ignore: &Gitignore, path: &Path) -> bool {
-        ignore
-            .matched_path_or_any_parents(path, path.is_dir())
-            .is_ignore()
-    }
-
     /// Rewrite a path from the FSEvents-reported form (symlinks resolved) to
     /// the form helix uses for document bookkeeping (symlinks preserved).
     /// Paths that don't start with `fs_root` are returned unchanged — they're
@@ -323,6 +412,70 @@ mod imp {
         match path.strip_prefix(fs_root) {
             Ok(rel) => helix_root.join(rel),
             Err(_) => path.to_path_buf(),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::fs;
+
+        /// `tempfile::tempdir()` lives under `/var/folders/...` on macOS,
+        /// which is itself a symlink to `/private/var/folders/...`. The
+        /// ignore matchers are built against the canonical (symlink-
+        /// resolved) form, so tests must compare against that too.
+        fn canonical(dir: &tempfile::TempDir) -> PathBuf {
+            std::fs::canonicalize(dir.path()).unwrap()
+        }
+
+        #[test]
+        fn root_pattern_ignores_matching_file() {
+            let tmp = tempfile::tempdir().unwrap();
+            fs::write(tmp.path().join(".gitignore"), "*.tmp\n").unwrap();
+            let root = canonical(&tmp);
+            let ignore = build_ignore(&root);
+
+            assert!(ignore.matches(&root.join("foo.tmp")));
+            assert!(!ignore.matches(&root.join("foo.rs")));
+        }
+
+        #[test]
+        fn nested_pattern_scopes_to_subdirectory() {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = canonical(&tmp);
+            fs::create_dir(root.join("sub")).unwrap();
+            fs::write(root.join("sub/.gitignore"), "secret\n").unwrap();
+            let ignore = build_ignore(&root);
+
+            // Pattern is scoped to /sub: matches /sub/secret, not /secret.
+            assert!(ignore.matches(&root.join("sub/secret")));
+            assert!(!ignore.matches(&root.join("secret")));
+        }
+
+        #[test]
+        fn deeper_whitelist_overrides_shallower_ignore() {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = canonical(&tmp);
+            fs::write(root.join(".gitignore"), "*.log\n").unwrap();
+            fs::create_dir(root.join("keep")).unwrap();
+            fs::write(root.join("keep/.gitignore"), "!important.log\n").unwrap();
+            let ignore = build_ignore(&root);
+
+            assert!(ignore.matches(&root.join("foo.log")));
+            assert!(ignore.matches(&root.join("keep/other.log")));
+            assert!(!ignore.matches(&root.join("keep/important.log")));
+        }
+
+        #[test]
+        fn git_directory_is_always_ignored() {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = canonical(&tmp);
+            // Don't even create .git on disk — the unconditional rule
+            // shouldn't depend on filesystem state.
+            let ignore = build_ignore(&root);
+
+            assert!(ignore.matches(&root.join(".git/HEAD")));
+            assert!(ignore.matches(&root.join(".git/objects/pack")));
         }
     }
 }
