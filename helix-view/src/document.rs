@@ -207,6 +207,20 @@ pub struct Document {
 
     pub readonly: bool,
 
+    /// Set when the workspace file watcher reports the file was removed
+    /// from disk while the buffer was dirty. Cleared by a successful save
+    /// or reload (both re-establish disk truth). Surfaced by the
+    /// statusline as `[!]`. Clean buffers are auto-closed on removal and
+    /// never reach this state.
+    pub deleted_on_disk: bool,
+
+    /// Set when the watcher reports the file's content changed on disk
+    /// while the buffer was dirty. The user resolves the divergence via
+    /// `:reload` (discard buffer changes) or `:write` (overwrite disk).
+    /// Surfaced by the statusline as `[≠]`. Clean buffers are reloaded
+    /// automatically and never reach this state.
+    pub disk_changed_unresolved: bool,
+
     pub previous_diagnostic_ids: HashMap<LanguageServerId, String>,
 
     /// Annotations for LSP document color swatches
@@ -754,6 +768,8 @@ impl Document {
             version_control_head: None,
             focused_at: std::time::Instant::now(),
             readonly: false,
+            deleted_on_disk: false,
+            disk_changed_unresolved: false,
             jump_labels: HashMap::new(),
             document_highlights: HashMap::new(),
             color_swatches: None,
@@ -1296,6 +1312,11 @@ impl Document {
         self.reset_modified();
         self.pickup_last_saved_time();
         self.detect_indent_and_line_ending();
+
+        // Reload re-establishes disk truth: the buffer now matches the
+        // file's current contents on disk.
+        self.deleted_on_disk = false;
+        self.disk_changed_unresolved = false;
 
         match provider_registry.get_diff_base(&path) {
             Some(diff_base) => self.set_diff_base(diff_base),
@@ -1842,6 +1863,10 @@ impl Document {
         );
         self.last_saved_revision = rev;
         self.last_saved_time = save_time;
+        // A successful save re-establishes disk truth: the file exists
+        // (re-created if it was missing) and matches the buffer.
+        self.deleted_on_disk = false;
+        self.disk_changed_unresolved = false;
     }
 
     /// Get the document's latest saved revision.
