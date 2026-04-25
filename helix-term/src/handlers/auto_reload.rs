@@ -20,6 +20,7 @@ pub fn handle(event: FileWatcherEvent, editor: &mut Editor) {
     match event {
         FileWatcherEvent::Modified(path) => handle_modified(path, editor),
         FileWatcherEvent::Removed(path) => handle_removed(path, editor),
+        FileWatcherEvent::Renamed { from, to } => handle_renamed(from, to, editor),
     }
 }
 
@@ -75,6 +76,18 @@ fn handle_removed(path: PathBuf, editor: &mut Editor) {
         unreachable!("close_document on freshly-checked clean buffer");
     }
     log::info!("auto-closed externally removed {}", path.display());
+}
+
+fn handle_renamed(from: PathBuf, to: PathBuf, editor: &mut Editor) {
+    let from = helix_stdx::path::canonicalize(&from);
+    let to = helix_stdx::path::canonicalize(&to);
+    let Some(doc_id) = editor.document_id_by_path(&from) else {
+        return;
+    };
+    // Always follow regardless of dirty state — the user's edit is still
+    // valid, just at a new location. Save would target the new path next.
+    editor.set_doc_path(doc_id, &to);
+    log::info!("auto-followed rename {} -> {}", from.display(), to.display());
 }
 
 /// Resolve an event path to a `(DocumentId, canonical_path)` if a buffer
