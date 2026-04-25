@@ -478,7 +478,12 @@ fn render_file_modification_indicator<'a, F>(context: &mut RenderContext<'a>, wr
 where
     F: Fn(&mut RenderContext<'a>, Span<'a>) + Copy,
 {
-    let title = if context.doc.is_modified() {
+    // `deleted_on_disk` is only set on dirty buffers (clean ones get
+    // auto-closed on removal), so the `[!]` case is a strict superset of
+    // `[+]` and wins the indicator slot.
+    let title = if context.doc.deleted_on_disk {
+        "[!]"
+    } else if context.doc.is_modified() {
         "[+]"
     } else {
         "   "
