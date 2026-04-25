@@ -555,16 +555,17 @@ pub mod completers {
     }
 
     pub fn lsp_workspace_command(editor: &Editor, input: &str) -> Vec<Completion> {
-        let commands = doc!(editor)
+        let commands: Vec<_> = doc!(editor)
             .language_servers_with_feature(LanguageServerFeature::WorkspaceCommand)
             .flat_map(|ls| {
                 ls.capabilities()
                     .execute_command_provider
-                    .iter()
-                    .flat_map(|options| options.commands.iter())
-            });
+                    .into_iter()
+                    .flat_map(|options| options.commands.into_iter())
+            })
+            .collect();
 
-        fuzzy_match(input, commands, false)
+        fuzzy_match(input, commands.iter(), false)
             .into_iter()
             .map(|(name, _)| ((0..), name.to_owned().into()))
             .collect()
