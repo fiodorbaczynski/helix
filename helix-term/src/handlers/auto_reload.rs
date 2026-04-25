@@ -28,12 +28,22 @@ fn handle_modified(path: PathBuf, editor: &mut Editor) {
         return;
     };
 
-    let doc = doc!(editor, &doc_id);
+    // FSEvents replays historical events on workspace open. A Modified for
+    // a path that no longer exists is a stale replay — don't try to act on
+    // it, and don't clear `deleted_on_disk` for a file that's still gone.
+    if !path.exists() {
+        return;
+    }
+
+    let doc = doc_mut!(editor, &doc_id);
     if doc.is_modified() {
-        let name = doc.display_name().into_owned();
-        editor.set_status(format!(
-            "{name} changed on disk; buffer has unsaved changes (use :reload to overwrite)"
-        ));
+        // Buffer is dirty and disk content has changed under us. Flag the
+        // divergence; the user resolves via `:reload` (discard buffer) or
+        // `:write` (overwrite disk). Clearing `deleted_on_disk` covers
+        // delete → recreate round-trips that left the flag set.
+        doc.deleted_on_disk = false;
+        doc.disk_changed_unresolved = true;
+        log::info!("disk diverged from dirty buffer: {}", path.display());
         return;
     }
 
