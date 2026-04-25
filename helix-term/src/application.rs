@@ -681,7 +681,7 @@ impl Application {
                 }
             }
             EditorEvent::ExternalFileChanged(event) => {
-                self.editor.handle_external_file_changed(event);
+                crate::handlers::auto_reload::handle(event, &mut self.editor);
                 self.render().await;
             }
             EditorEvent::Redraw => {
