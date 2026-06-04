@@ -400,6 +400,10 @@ pub struct Config {
     /// This prevents data loss if the editor is interrupted while writing the file, but may
     /// confuse some file watching/hot reloading programs. Defaults to `true`.
     pub atomic_save: bool,
+    /// Whether to reload open buffers when their file changes externally on
+    /// disk. Unmodified buffers are reloaded silently; modified buffers emit
+    /// a status-line warning and are left untouched. Defaults to `true`.
+    pub auto_reload: bool,
     /// Whether to automatically remove all trailing line-endings after the final one on write.
     /// Defaults to `false`.
     pub trim_final_newlines: bool,
@@ -1145,6 +1149,7 @@ impl Default for Config {
             default_line_ending: LineEndingConfig::default(),
             insert_final_newline: true,
             atomic_save: true,
+            auto_reload: true,
             trim_final_newlines: false,
             trim_trailing_whitespace: false,
             smart_tab: Some(SmartTabConfig::default()),
@@ -1211,6 +1216,12 @@ pub struct Editor {
     pub language_servers: helix_lsp::Registry,
     pub diagnostics: Diagnostics,
     pub diff_providers: DiffProviderRegistry,
+    pub file_watcher: Option<crate::handlers::file_watcher::FileWatcher>,
+    /// Kept alive so `file_watcher_events` stays open even when no watcher is
+    /// running (e.g. helix was launched outside a workspace). Clones are
+    /// handed to the watcher's drain task when it starts.
+    _file_watcher_tx: UnboundedSender<crate::handlers::file_watcher::FileWatcherEvent>,
+    file_watcher_events: UnboundedReceiver<crate::handlers::file_watcher::FileWatcherEvent>,
 
     pub debug_adapters: dap::registry::Registry,
     pub breakpoints: HashMap<PathBuf, Vec<Breakpoint>>,
@@ -1272,6 +1283,7 @@ pub enum EditorEvent {
     ConfigEvent(ConfigEvent),
     LanguageServerMessage((LanguageServerId, Call)),
     DebuggerEvent((DebugAdapterId, dap::Payload)),
+    ExternalFileChanged(crate::handlers::file_watcher::FileWatcherEvent),
     IdleTimer,
     Redraw,
 }
@@ -1340,6 +1352,18 @@ impl Editor {
         let conf = config.load();
         let auto_pairs = (&conf.auto_pairs).into();
 
+        let (file_watcher_tx, file_watcher_events) = unbounded_channel();
+        let file_watcher = crate::handlers::file_watcher::workspace_root(
+            &helix_stdx::env::current_working_dir(),
+        )
+        .and_then(|root| {
+            crate::handlers::file_watcher::FileWatcher::start(
+                root,
+                language_servers.file_event_handler.clone(),
+                file_watcher_tx.clone(),
+            )
+        });
+
         // HAXX: offset the render area height by 1 to account for prompt/commandline
         area.height -= 1;
 
@@ -1358,6 +1382,9 @@ impl Editor {
             theme: theme_loader.default(),
             language_servers,
             diagnostics: Diagnostics::new(),
+            file_watcher,
+            _file_watcher_tx: file_watcher_tx,
+            file_watcher_events,
             diff_providers: DiffProviderRegistry::default(),
             debug_adapters: dap::registry::Registry::new(),
             breakpoints: HashMap::new(),
@@ -2309,6 +2336,10 @@ impl Editor {
                     return EditorEvent::DebuggerEvent(event)
                 }
 
+                Some(event) = self.file_watcher_events.recv() => {
+                    return EditorEvent::ExternalFileChanged(event)
+                }
+
                 _ = helix_event::redraw_requested() => {
                     if  !self.needs_redraw{
                         self.needs_redraw = true;
@@ -2328,6 +2359,39 @@ impl Editor {
                 }
             }
         }
+    }
+
+    /// Reload an open document from disk.
+    ///
+    /// `Document::reload` ultimately calls `apply_inner`, which indexes
+    /// `selections[view_id]` and panics if the document isn't attached to
+    /// that view. Background buffers (the typical external-change case) may
+    /// not be attached to the focused view, so this picks an existing
+    /// attached view if any, otherwise attaches the document to the
+    /// currently-focused view first.
+    ///
+    /// Pure mechanics: no config gate, no dirty-buffer check, no status or
+    /// error reporting. Callers decide policy and surface results.
+    pub fn reload_document(&mut self, doc_id: DocumentId) -> Result<(), Error> {
+        let focused = self.tree.focus;
+        let view_id = {
+            let doc = doc_mut!(self, &doc_id);
+            if let Some(id) = doc.selections().keys().copied().next() {
+                id
+            } else {
+                doc.ensure_view_init(focused);
+                focused
+            }
+        };
+
+        let scrolloff = self.config().scrolloff;
+        let view = view_mut!(self, view_id);
+        let doc = doc_mut!(self, &doc_id);
+        view.sync_changes(doc);
+
+        doc.reload(view, &self.diff_providers)?;
+        view.ensure_cursor_in_view(doc, scrolloff);
+        Ok(())
     }
 
     pub async fn flush_writes(&mut self) -> anyhow::Result<()> {
