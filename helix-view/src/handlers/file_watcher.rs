@@ -1,8 +1,8 @@
 //! Workspace file watcher for external-change buffer reloads.
 //!
-//! Helix watches the workspace it was launched in (cwd containing a `.git`
-//! entry) and feeds filesystem events into the editor to reload open buffers
-//! and drive LSP `DidChangeWatchedFiles` fan-out.
+//! Helix watches the workspace enclosing its cwd and feeds filesystem events
+//! into the editor to reload open buffers and drive LSP
+//! `DidChangeWatchedFiles` fan-out.
 //!
 //! Currently macOS-only; on other platforms [`FileWatcher::start`] returns
 //! `None` and the editor behaves as before.
@@ -29,16 +29,20 @@ pub enum FileWatcherEvent {
     Renamed { from: PathBuf, to: PathBuf },
 }
 
-/// Returns the workspace root if `cwd` is itself a workspace.
+/// Returns the workspace enclosing `cwd`, or `None` if there isn't one.
 ///
-/// A directory is a workspace iff it directly contains a `.git` entry — regular
-/// directory, submodule pointer file, or symlink all qualify. No walk-up, no
-/// other heuristics: helix watches what the user explicitly pointed it at.
+/// Defers to [`helix_loader::find_workspace_in`], the same ancestor walk that
+/// backs the file picker and the LSP root ceiling, so the watched tree always
+/// agrees with the tree the rest of the editor calls the workspace. Launching
+/// in a subdirectory — a single crate of a cargo workspace, say — therefore
+/// watches the whole repository rather than disabling the watcher.
+///
+/// Its fallback of "no marker anywhere up the tree, so use `cwd`" is rejected
+/// here: watching a bare directory could mean recursively watching `$HOME`.
 pub fn workspace_root(cwd: &Path) -> Option<PathBuf> {
-    cwd.join(".git")
-        .try_exists()
-        .ok()
-        .and_then(|exists| exists.then(|| cwd.to_path_buf()))
+    let (root, is_fallback) = helix_loader::find_workspace_in(cwd);
+
+    (!is_fallback).then_some(root)
 }
 
 #[cfg(target_os = "macos")]
@@ -606,8 +610,21 @@ mod tests {
     }
 
     #[test]
-    fn rejects_non_workspace_directory() {
+    fn finds_workspace_from_subdirectory() {
         let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir(tmp.path().join(".git")).unwrap();
+        let crate_dir = tmp.path().join("crates/parser");
+        fs::create_dir_all(&crate_dir).unwrap();
+
+        assert_eq!(workspace_root(&crate_dir).as_deref(), Some(tmp.path()));
+    }
+
+    #[test]
+    fn rejects_non_workspace_directory() {
+        // Relies on no ancestor of the tempdir carrying a workspace marker,
+        // which holds for the system temp directory on every supported platform.
+        let tmp = tempfile::tempdir().unwrap();
+
         assert_eq!(workspace_root(tmp.path()), None);
     }
 }
