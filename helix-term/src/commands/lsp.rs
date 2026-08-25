@@ -5,7 +5,7 @@ use helix_lsp::{
         self, CodeAction, CodeActionKind, CodeActionOrCommand, CodeActionTriggerKind,
         DiagnosticSeverity, NumberOrString,
     },
-    util::{diagnostic_to_lsp_diagnostic, lsp_range_to_range, range_to_lsp_range},
+    util::{diagnostic_to_lsp_diagnostic, lsp_range_to_range, pos_to_lsp_pos, range_to_lsp_range},
     Client, LanguageServerId, OffsetEncoding,
 };
 use tokio_stream::StreamExt;
@@ -688,7 +688,13 @@ pub(crate) fn code_actions_for_range(
         .filter_map(|language_server| {
             let offset_encoding = language_server.offset_encoding();
             let language_server_id = language_server.id();
-            let lsp_range = range_to_lsp_range(doc.text(), range, offset_encoding);
+            let lsp_range = if range.len() <= 1 {
+                let pos =
+                    pos_to_lsp_pos(doc.text(), range.cursor(doc.text().slice(..)), offset_encoding);
+                lsp::Range::new(pos, pos)
+            } else {
+                range_to_lsp_range(doc.text(), range, offset_encoding)
+            };
             // Filter and convert overlapping diagnostics
             let code_action_context = lsp::CodeActionContext {
                 diagnostics: doc
