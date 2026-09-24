@@ -434,6 +434,8 @@ pub struct Config {
     pub buffer_picker: BufferPickerConfig,
     /// Workspace-trust configuration.
     pub workspace_trust: WorkspaceTrustConfig,
+    /// Whether to jump between multiplexer panes when a view jump hits the edge of the editor.
+    pub smooth_panes: bool,
 }
 
 /// User-facing configuration for `[editor.workspace-trust]`.
@@ -1240,6 +1242,7 @@ impl Default for Config {
             kitty_keyboard_protocol: Default::default(),
             buffer_picker: BufferPickerConfig::default(),
             workspace_trust: WorkspaceTrustConfig::default(),
+            smooth_panes: false,
         }
     }
 }
@@ -2310,10 +2313,13 @@ impl Editor {
         self.focus(self.tree.prev());
     }
 
-    pub fn focus_direction(&mut self, direction: tree::Direction) {
+    pub fn focus_direction(&mut self, direction: tree::Direction) -> Result<(), ()> {
         let current_view = self.tree.focus;
         if let Some(id) = self.tree.find_split_in_direction(current_view, direction) {
-            self.focus(id)
+            self.focus(id);
+            Ok(())
+        } else {
+            Err(())
         }
     }
 
