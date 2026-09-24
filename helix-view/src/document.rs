@@ -957,6 +957,10 @@ impl Document {
             lsp::FormattingOptions {
                 tab_size: self.tab_width() as u32,
                 insert_spaces: matches!(self.indent_style, IndentStyle::Spaces(_)),
+                // Formatting runs after the on-save newline handling, so the
+                // server must be told to preserve its result.
+                insert_final_newline: Some(self.insert_final_newline()),
+                trim_final_newlines: Some(self.config.load().trim_final_newlines),
                 ..Default::default()
             },
             None,
