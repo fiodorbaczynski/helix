@@ -140,10 +140,16 @@ impl Handler {
 
                     let mut builder = GlobSetBuilder::new();
                     for watcher in ops.watchers {
-                        if let lsp::GlobPattern::String(pattern) = watcher.glob_pattern {
-                            if let Ok(glob) = GlobBuilder::new(&pattern).build() {
+                        let Some(pattern) = resolve_glob_pattern(watcher.glob_pattern) else {
+                            continue;
+                        };
+                        match GlobBuilder::new(&pattern).build() {
+                            Ok(glob) => {
                                 builder.add(glob);
                             }
+                            Err(err) => log::warn!(
+                                "ignoring didChangeWatchedFiles pattern `{pattern}`: {err}"
+                            ),
                         }
                     }
                     match builder.build() {
@@ -185,5 +191,118 @@ impl Handler {
                 }
             }
         }
+    }
+}
+
+/// Reduce an LSP `GlobPattern` to a single glob string suitable for
+/// `globset::GlobBuilder`.
+///
+/// LSP 3.17 introduced `RelativePattern { baseUri, pattern }` as an
+/// alternative to plain string patterns; servers prefer it when the client
+/// advertises `relativePatternSupport`. We resolve the base URI to a path
+/// and prepend it to the pattern so the resulting glob can match against
+/// absolute filesystem paths.
+///
+/// Returns `None` if the base URI of a relative pattern isn't a `file:` URI
+/// — there is no meaningful filesystem glob in that case.
+fn resolve_glob_pattern(pattern: lsp::GlobPattern) -> Option<String> {
+    match pattern {
+        lsp::GlobPattern::String(pattern) => Some(pattern),
+        lsp::GlobPattern::Relative(relative) => {
+            let base_uri = match relative.base_uri {
+                lsp::OneOf::Left(folder) => folder.uri,
+                lsp::OneOf::Right(uri) => uri,
+            };
+            let base = match base_uri.to_file_path() {
+                Ok(path) => path,
+                Err(()) => {
+                    log::warn!(
+                        "ignoring didChangeWatchedFiles relative pattern with non-file baseUri: {base_uri}"
+                    );
+                    return None;
+                }
+            };
+            // `globset` parses patterns with `/` as the path separator on
+            // every platform; normalise so Windows base paths compose too.
+            let base = base.to_string_lossy().replace('\\', "/");
+            Some(format!(
+                "{}/{}",
+                base.trim_end_matches('/'),
+                relative.pattern
+            ))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn relative(base: &str, pattern: &str) -> lsp::GlobPattern {
+        lsp::GlobPattern::Relative(lsp::RelativePattern {
+            base_uri: lsp::OneOf::Right(lsp::Url::parse(base).unwrap()),
+            pattern: pattern.to_owned(),
+        })
+    }
+
+    #[test]
+    fn string_pattern_passes_through() {
+        let pattern = lsp::GlobPattern::String("**/*.rs".to_owned());
+        assert_eq!(resolve_glob_pattern(pattern).as_deref(), Some("**/*.rs"));
+    }
+
+    #[test]
+    fn relative_pattern_prepends_base_path() {
+        let pattern = relative("file:///workspace/crate", "**/*.rs");
+        assert_eq!(
+            resolve_glob_pattern(pattern).as_deref(),
+            Some("/workspace/crate/**/*.rs"),
+        );
+    }
+
+    #[test]
+    fn relative_pattern_strips_trailing_slash_from_base() {
+        // Some servers terminate the base URI with `/`. Composing naively
+        // would produce `//**/*.rs`, which globset treats as a different
+        // pattern than `/**/*.rs`.
+        let pattern = relative("file:///workspace/crate/", "**/*.rs");
+        assert_eq!(
+            resolve_glob_pattern(pattern).as_deref(),
+            Some("/workspace/crate/**/*.rs"),
+        );
+    }
+
+    #[test]
+    fn relative_pattern_resolved_glob_matches_descendant() {
+        // End-to-end: the resolved string, fed back through globset, must
+        // match an absolute path inside the base — this is the contract the
+        // call site relies on.
+        let pattern = relative("file:///workspace/crate", "**/*.rs");
+        let resolved = resolve_glob_pattern(pattern).unwrap();
+        let glob = GlobBuilder::new(&resolved).build().unwrap().compile_matcher();
+        assert!(glob.is_match("/workspace/crate/src/lib.rs"));
+        assert!(glob.is_match("/workspace/crate/src/nested/mod.rs"));
+        assert!(!glob.is_match("/workspace/other/src/lib.rs"));
+    }
+
+    #[test]
+    fn relative_pattern_with_workspace_folder_base() {
+        let pattern = lsp::GlobPattern::Relative(lsp::RelativePattern {
+            base_uri: lsp::OneOf::Left(lsp::WorkspaceFolder {
+                uri: lsp::Url::parse("file:///workspace/crate").unwrap(),
+                name: "crate".to_owned(),
+            }),
+            pattern: "**/Cargo.toml".to_owned(),
+        });
+        assert_eq!(
+            resolve_glob_pattern(pattern).as_deref(),
+            Some("/workspace/crate/**/Cargo.toml"),
+        );
+    }
+
+    #[test]
+    fn non_file_base_uri_is_skipped() {
+        let pattern = relative("https://example.com/", "**/*.rs");
+        assert_eq!(resolve_glob_pattern(pattern), None);
     }
 }
