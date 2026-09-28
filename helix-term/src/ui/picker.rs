@@ -22,8 +22,8 @@ use tokio::sync::mpsc::Sender;
 use tui::{
     buffer::Buffer as Surface,
     layout::Constraint,
-    text::{Span, Spans},
-    widgets::{Block, BorderType, Cell, Row, Table},
+    text::{Span, Spans, Text},
+    widgets::{Block, BorderType, Cell, Paragraph, Row, Table, Wrap},
 };
 
 use tui::widgets::Widget;
@@ -60,6 +60,10 @@ pub const MIN_AREA_WIDTH_FOR_PREVIEW: u16 = 72;
 pub const MIN_AREA_HEIGHT_FOR_STACKED_PREVIEW: u16 = 36;
 /// Terminal cells are about 1:2 aspect ratio
 const CELL_ASPECT: u16 = 2;
+/// Items the list must still show when a detail box takes space below it
+const MIN_LIST_ROWS_WITH_DETAIL: u16 = 3;
+/// Lines of text the detail box must be able to show
+const MIN_DETAIL_ROWS: u16 = 3;
 /// Biggest file size to preview in bytes
 pub const MAX_FILE_SIZE_FOR_PREVIEW: u64 = 10 * 1024 * 1024;
 
@@ -188,6 +192,7 @@ impl<T, D> Injector<T, D> {
 }
 
 type ColumnFormatFn<T, D> = for<'a> fn(&'a T, &'a D) -> Cell<'a>;
+type DetailFormatFn<T, D> = for<'a> fn(&'a T, &'a D) -> Text<'a>;
 
 pub struct Column<T, D> {
     name: Arc<str>,
@@ -269,6 +274,8 @@ pub struct Picker<T: 'static + Send + Sync, D: 'static> {
     read_buffer: Vec<u8>,
     /// Given an item in the picker, return the file path and line number to display.
     file_fn: Option<FileCallback<T>>,
+    /// Given an item in the picker, return the text to show in full below the list.
+    detail_fn: Option<DetailFormatFn<T, D>>,
     /// An event handler for syntax highlighting the currently previewed file.
     preview_highlight_handler: Sender<Arc<Path>>,
     dynamic_query_handler: Option<Sender<DynamicQueryChange>>,
@@ -395,6 +402,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             preview_cache: HashMap::new(),
             read_buffer: Vec::with_capacity(1024),
             file_fn: None,
+            detail_fn: None,
             preview_highlight_handler: PreviewHighlightHandler::<T, D>::default().spawn(),
             dynamic_query_handler: None,
         }
@@ -424,6 +432,11 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
         // assumption: if we have a preview we are matching paths... If this is ever
         // not true this could be a separate builder function
         self.matcher.update_config(Config::DEFAULT.match_paths());
+        self
+    }
+
+    pub fn with_detail(mut self, detail_fn: DetailFormatFn<T, D>) -> Self {
+        self.detail_fn = Some(detail_fn);
         self
     }
 
@@ -521,6 +534,30 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
         } else {
             0
         }
+    }
+
+    /// Rows the list box spends on its borders, prompt, separator and column header.
+    fn list_decoration_height(&self) -> u16 {
+        4 + self.header_height()
+    }
+
+    /// Splits the picker's column into the list box and, when the picker has a detail
+    /// function and both boxes fit at their minimum heights, a detail box below it.
+    fn split_detail(&self, area: Rect) -> (Rect, Option<Rect>) {
+        let list_min = self.list_decoration_height() + MIN_LIST_ROWS_WITH_DETAIL;
+        // top and bottom border
+        let detail_min = 2 + MIN_DETAIL_ROWS;
+
+        if self.detail_fn.is_none() || area.height < list_min + detail_min {
+            return (area, None);
+        }
+
+        let list_height = (area.height / 2).clamp(list_min, area.height - detail_min);
+
+        (
+            area.with_height(list_height),
+            Some(area.clip_top(list_height)),
+        )
     }
 
     pub fn toggle_preview(&mut self) {
@@ -1024,6 +1061,30 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             );
         }
     }
+
+    fn render_detail(&self, area: Rect, surface: &mut Surface, cx: &mut Context) {
+        let background = cx.editor.theme.get("ui.background");
+        let text = cx.editor.theme.get("ui.text");
+        surface.clear_with(area, background);
+
+        const BLOCK: Block<'_> = Block::bordered();
+
+        // 1 column gap on either side, as in the preview
+        let inner = BLOCK.inner(area).inner(Margin::horizontal(1));
+        BLOCK.render(area, surface);
+
+        let detail = self
+            .selection()
+            .zip(self.detail_fn)
+            .map(|(item, detail_fn)| detail_fn(item, &self.editor_data));
+
+        if let Some(detail) = detail {
+            Paragraph::new(&detail)
+                .style(text)
+                .wrap(Wrap { trim: false })
+                .render(inner, surface);
+        }
+    }
 }
 
 impl<I: 'static + Send + Sync, D: 'static + Send + Sync> Picker<I, D> {
@@ -1058,7 +1119,13 @@ impl<I: 'static + Send + Sync, D: 'static + Send + Sync> Picker<I, D> {
 impl<I: 'static + Send + Sync, D: 'static + Send + Sync> Component for Picker<I, D> {
     fn render(&mut self, area: Rect, surface: &mut Surface, cx: &mut Context) {
         let (picker_area, preview_area) = self.layout(area);
-        self.render_picker(picker_area, surface, cx);
+        let (list_area, detail_area) = self.split_detail(picker_area);
+        self.render_picker(list_area, surface, cx);
+
+        if let Some(detail_area) = detail_area {
+            self.render_detail(detail_area, surface, cx);
+        }
+
         if let Some(preview_area) = preview_area {
             self.render_preview(preview_area, surface, cx);
         }
@@ -1195,7 +1262,10 @@ impl<I: 'static + Send + Sync, D: 'static + Send + Sync> Component for Picker<I,
 
     fn required_size(&mut self, (width, height): (u16, u16)) -> Option<(u16, u16)> {
         let (picker_area, _) = self.layout(Rect::new(0, 0, width, height));
-        self.completion_height = picker_area.height.saturating_sub(4 + self.header_height());
+        let (list_area, _) = self.split_detail(picker_area);
+        self.completion_height = list_area
+            .height
+            .saturating_sub(self.list_decoration_height());
         Some((width, height))
     }
 
