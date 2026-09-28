@@ -403,9 +403,24 @@ fn handle_insert_same(doc: &Rope, range: &Range, pair: &Pair) -> Option<(Change,
             return None;
         }
 
-        let pair_str = Tendril::from_iter([pair.open, pair.close]);
-        len_inserted = 2;
-        (cursor, cursor, Some(pair_str))
+        let prev = prev_char(doc, cursor);
+        let prev_prev = if cursor >= 2 { doc.get_char(cursor - 2) } else { None };
+
+        if prev == Some(pair.open) && prev_prev == Some(pair.open) {
+            // Complete triple: insert closing triple with empty line between
+            let mut pair_str = Tendril::from_iter([pair.open]);
+            pair_str.push('\n');
+            pair_str.push('\n');
+            pair_str.push(pair.close);
+            pair_str.push(pair.close);
+            pair_str.push(pair.close);
+            len_inserted = 3;
+            (cursor, cursor, Some(pair_str))
+        } else {
+            let pair_str = Tendril::from_iter([pair.open, pair.close]);
+            len_inserted = 2;
+            (cursor, cursor, Some(pair_str))
+        }
     };
 
     let next_range = get_next_range(doc, range, len_inserted);
