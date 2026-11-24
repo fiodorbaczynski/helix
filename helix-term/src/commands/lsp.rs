@@ -312,6 +312,7 @@ fn diag_picker(
         },
     )
     .with_preview(move |_editor, diag| location_to_file_location(&diag.location))
+    .with_detail(|item: &PickerDiagnostic, _| item.diag.message.as_str().into())
     .truncate_start(false)
 }
 
